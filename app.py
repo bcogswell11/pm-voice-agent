@@ -45,8 +45,48 @@ def voice_stream_test():
 # --- WebSocket /stream route (accepts Twilio Media Stream frames; no audio returned yet) ---
 @sock.route("/stream")
 def stream(ws):
+    """
+    Minimal Twilio Media Streams handler:
+    - Waits for first message to learn the streamSid
+    - Immediately sends a 'mark' back so Twilio knows we're alive
+    - Then keeps reading media frames until 'stop'
+    - Gracefully handles client close without noisy tracebacks
+    """
+    import json
+
+    stream_sid = None
     starts = medias = stops = 0
+
     try:
+        # Read first message (usually "connected" or "start")
+        first = ws.receive()
+        if first is None:
+            print("[stream] connection closed before first message")
+            return
+
+        try:
+            data = json.loads(first)
+        except Exception:
+            data = {}
+
+        stream_sid = data.get("streamSid") or data.get("start", {}).get("streamSid")
+        evt = data.get("event")
+
+        if evt == "start":
+            starts += 1
+
+        # Send a quick 'mark' back so Twilio sees a server-originating frame
+        if stream_sid:
+            try:
+                ws.send(json.dumps({
+                    "event": "mark",
+                    "streamSid": stream_sid,
+                    "mark": {"name": "hello_from_server"}
+                }))
+            except Exception:
+                pass
+
+        # Main loop: read frames until 'stop'
         while True:
             msg = ws.receive()
             if msg is None:
@@ -57,18 +97,22 @@ def stream(ws):
                 continue
 
             evt = data.get("event")
-            if evt == "start":
-                starts += 1
-            elif evt == "media":
+            if evt == "media":
                 medias += 1
+            elif evt == "start":
+                starts += 1
+                # update stream_sid if present
+                stream_sid = data.get("streamSid") or stream_sid
             elif evt == "stop":
                 stops += 1
                 break
-    except Exception:
-        pass
-    # Helpful debug line (shows up in Heroku logs)
-    print(f"[stream] start={starts}, media={medias}, stop={stops}")
 
+    except Exception:
+        # Swallow EOFs and other disconnect noise
+        pass
+
+    print(f"[stream] sid={stream_sid} start={starts}, media={medias}, stop={stops}")
+    
 # --- Main (local only; Heroku uses Procfile) ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
