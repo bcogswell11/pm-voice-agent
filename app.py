@@ -204,6 +204,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             pass
 
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     if not OPENAI_API_KEY:
@@ -219,35 +220,54 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # Tell OpenAI to speak in μ-law/8k for Twilio compatibility + request audio modality + voice
+        # GA Realtime session config (audio in/out for Twilio + server VAD)
         session_update = {
             "type": "session.update",
             "session": {
-                "modalities": ["audio", "text"],        # text is required with audio
-                "voice": OPENAI_VOICE,                   # alloy/coral/sage/verse/etc.
-                "input_audio_format": "pcm16",      # <— was g711_ulaw
-                "output_audio_format": "g711_ulaw"  # keep μ-law for Twilio playback
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] sent session.update for g711_ulaw/8k")
+                "type": "realtime",
+                "model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime"),
 
-        # Immediate greeting so caller hears voice
-        hello = {
-            "type": "response.create",
-            "response": {
+                # We want audio out
+                "output_modalities": ["audio"],
+
+                # Twilio uses PCMU (G.711 μ-law @ 8k) over its Media Streams
+                "audio": {
+                    "input": {
+                        "format": { "type": "audio/pcmu" },
+                        "turn_detection": { "type": "server_vad" }
+                    },
+                    "output": {
+                        "format": { "type": "audio/pcmu" },
+                        "voice": OPENAI_VOICE
+                    }
+                },
+
+                # Session-wide system-style instructions
                 "instructions": (
                     "You are a friendly property management assistant. "
                     "Greet the caller and let them know you can take maintenance requests, "
                     "answer general questions, or forward to a live person."
+                )
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
+        print("[stream] sent session.update (GA, audio/pcmu)")
+
+        # Optional: send an immediate greeting response
+        hello = {
+            "type": "response.create",
+            "response": {
+                "instructions": (
+                    "Welcome to Escallop Property Management. "
+                    "I can take a maintenance request, answer general questions, or forward you to a live person."
                 ),
-                "modalities": ["audio", "text"],   # ensure audio is produced
+                "modalities": ["audio", "text"]
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(hello)))
 
-        # Start relays
-        stream_info = {"sid": None}  # holds Twilio streamSid
+        # Relay tasks — make sure your twilio/openai relay functions accept stream_info
+        stream_info = {"sid": None}  # will be filled from Twilio 'start' event
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
 
@@ -268,6 +288,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
+
 
 
 # --- Main (local only) ---
