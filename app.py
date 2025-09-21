@@ -212,7 +212,7 @@ def stream(ws):
                     "Greet the caller and let them know you can take maintenance requests, "
                     "answer general questions, or forward to a live person."
                 ),
-                "modalities": ["audio"],   # ensure audio is produced
+                "modalities": ["audio", "text"],   # ensure audio is produced
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(hello)))
