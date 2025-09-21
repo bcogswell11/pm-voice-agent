@@ -221,6 +221,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
 
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     if not OPENAI_API_KEY:
@@ -236,50 +237,45 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
+        # Minimal session schema supported by your endpoint
         session_update = {
             "type": "session.update",
             "session": {
-                # Use the minimal, supported fields
-                "modalities": ["audio", "text"],   # MUST include both with this API
-                "voice": OPENAI_VOICE,             # e.g. "alloy"
-                "input_audio_format": "g711_ulaw", # Twilio sends μ-law @ 8k
-                "output_audio_format": "g711_ulaw" # Send μ-law back to Twilio
+                "modalities": ["audio", "text"],   # must include both
+                "voice": OPENAI_VOICE,             # e.g., "alloy"
+                "input_audio_format": "g711_ulaw", # Twilio -> OpenAI
+                "output_audio_format": "g711_ulaw" # OpenAI -> Twilio
             }
         }
-
-         
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] sent session.update (simple, g711_ulaw)")
 
-       # Relay tasks (start the READER first so we don't miss audio)
-stream_info = {"sid": None}
-recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))  # <-- start listener first
+        # Start the OpenAI->Twilio reader FIRST so we don't miss audio
+        stream_info = {"sid": None}  # filled by 'start' event in twilio_to_openai
+        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
+        loop.run_until_complete(asyncio.sleep(0))  # tiny yield so task is active
 
-# (tiny yield so listener is fully running)
-loop.run_until_complete(asyncio.sleep(0))
+        # Send immediate greeting
+        hello = {
+            "type": "response.create",
+            "response": {
+                "instructions": (
+                    "Welcome to Escallop Property Management. "
+                    "I can take a maintenance request, answer general questions, or forward you to a live person."
+                ),
+                "modalities": ["audio", "text"]
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(hello)))
+        print("[stream] sent greeting response.create")
 
-# Now send the greeting
-hello = {
-    "type": "response.create",
-    "response": {
-        "instructions": (
-            "Welcome to Escallop Property Management. "
-            "I can take a maintenance request, answer general questions, or forward you to a live person."
-        ),
-        "modalities": ["audio", "text"]
-    }
-}
-loop.run_until_complete(openai_ws.send(json.dumps(hello)))
-print("[stream] sent greeting response.create")
+        # Now start the Twilio->OpenAI sender
+        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
-# Finally, start the Twilio->OpenAI sender
-send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
-
-
-        # Wait for either side to finish
+        # Wait for both relays to finish
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
-        # Clean up
+        # Clean up the OpenAI socket
         try:
             loop.run_until_complete(openai_ws.close())
         except Exception:
