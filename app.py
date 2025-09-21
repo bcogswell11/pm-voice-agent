@@ -194,7 +194,7 @@ def stream(ws):
         session_update = {
             "type": "session.update",
             "session": {
-                "modalities": ["audio"],
+                "modalities": ["audio", "text"],
                 "voice": OPENAI_VOICE,
                 "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
                 "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
