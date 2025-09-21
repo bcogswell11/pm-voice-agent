@@ -105,9 +105,9 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Pump Twilio media frames into OpenAI:
-      - append base64 PCMU frames with input_audio_buffer.append
-      - after a few frames, commit once and trigger response.create
+    Pump Twilio media frames into OpenAI input buffer using GA-expected shape:
+      {"type":"input_audio_buffer.append","audio":{"data": "<base64>", "mime_type":"audio/pcmu"}}
+    Then commit after enough frames and trigger response.
     """
     inbound_frames = 0
     committed = False
@@ -119,6 +119,7 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
         except Exception as e:
             log("twilio.recv.exception", err=str(e))
             break
+
         if msg is None:
             log("twilio.recv.none")
             break
@@ -138,34 +139,43 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             sid = data.get("start", {}).get("streamSid")
             stream_info["sid"] = sid
             log("twilio.start", streamSid=sid, track=data.get("start", {}).get("tracks"))
+
         elif evt == "media":
             inbound_frames += 1
             payload = data.get("media", {}).get("payload", "")
+
+            # Log first 3 and every 200th inbound media frame
             if inbound_frames <= 3 or inbound_frames % 200 == 0:
                 log("twilio.media.in", count=inbound_frames, payload_preview=b64preview(payload))
 
-            # 1) forward each frame to OpenAI as PCMU base64
+            # --- GA APPEND SHAPE (object with data + mime_type) ---
             try:
                 await openai_ws.send(json.dumps({
                     "type": "input_audio_buffer.append",
-                    "audio": payload  # base64 PCMU from Twilio
+                    "audio": {
+                        "data": payload,                 # base64 PCMU from Twilio
+                        "mime_type": "audio/pcmu"        # explicit, even though session declares it
+                    }
                 }))
             except Exception as e:
                 log("openai.append.error", err=str(e))
 
-            # 2) after ~30 frames (~375ms), commit once and trigger a response
-            if not committed and inbound_frames >= 30:
+            # Commit after ~60 frames (~0.75s) to guarantee >=100ms seen by GA
+            if not committed and inbound_frames >= 60:
                 try:
                     await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    log("openai.input.commit")
+                    log("openai.input.commit", frames=inbound_frames)
+
                     await openai_ws.send(json.dumps({"type": "response.create"}))
                     log("response.create.sent_after_commit")
                     committed = True
                 except Exception as e:
                     log("openai.commit_or_response.error", err=str(e))
+
         elif evt == "stop":
             log("twilio.stop.recv")
             break
+
         else:
             if evt not in ("connected", "heartbeat", "mark"):
                 log("twilio.event.other", raw=data)
