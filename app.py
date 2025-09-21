@@ -78,8 +78,13 @@ async def twilio_to_openai(twilio_ws, openai_ws):
     """
     Read Twilio frames and append audio to OpenAI input buffer.
     """
-    await openai_ws.send(json.dumps({"type": "input_audio_buffer.create"}))
+    # Clear the buffer at the start (supported command)
+    try:
+        await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+    except Exception:
+        pass
     first_chunk_sent = False
+
 
     while True:
         msg = twilio_ws.receive()
