@@ -105,104 +105,160 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Minimal: capture Twilio streamSid from 'start'. Ignore media (no input).
-    Non-blocking reads so we don't freeze the loop.
+    Capture Twilio 'start' (streamSid), count inbound frames,
+    and report unusual Twilio events while we ignore input audio.
     """
+    inbound_frames = 0
+    last_event = None
+
     while True:
         try:
             msg = await asyncio.to_thread(twilio_ws.receive)
-        except Exception:
-            print("[twilio->openai] receive() raised -> break")
+        except Exception as e:
+            log("twilio.recv.exception", err=str(e))
             break
+
         if msg is None:
-            print("[twilio->openai] ws.receive() returned None -> break")
+            log("twilio.recv.none")  # socket closed
             break
 
         try:
             data = json.loads(msg)
         except Exception:
+            log("twilio.recv.parse_error", msg_preview=str(msg)[:80])
             continue
 
         evt = data.get("event")
+        if evt != last_event:
+            # Log on change to reduce noise
+            log("twilio.event", type=evt)
+            last_event = evt
+
         if evt == "start":
-            try:
-                stream_info["sid"] = data.get("start", {}).get("streamSid")
-                print(f"[twilio] start streamSid={stream_info['sid']}")
-            except Exception:
-                pass
+            sid = data.get("start", {}).get("streamSid")
+            stream_info["sid"] = sid
+            log("twilio.start", streamSid=sid, track=data.get("start", {}).get("tracks"))
+        elif evt == "media":
+            inbound_frames += 1
+            # Log first 3 and every 200th inbound media frame
+            if inbound_frames <= 3 or inbound_frames % 200 == 0:
+                payload = data.get("media", {}).get("payload", "")
+                log("twilio.media.in",
+                    count=inbound_frames,
+                    payload_preview=b64preview(payload))
+        elif evt == "mark":
+            log("twilio.mark", name=data.get("mark", {}).get("name"))
         elif evt == "stop":
-            print("[twilio->openai] received stop -> break")
+            log("twilio.stop.recv")
             break
-        # ignore other events
+        else:
+            # Unknown or less common Twilio events
+            if evt not in ("connected", "heartbeat"):
+                log("twilio.event.other", raw=data)
+
     return
+
 
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    Read OpenAI audio deltas and send to Twilio as media frames (with streamSid).
+    Read OpenAI events; forward audio deltas to Twilio.
+    Emits detailed counters and previews.
     """
+    oa_events = 0
+    oa_audio_deltas = 0
+    tw_media_sent = 0
+    last_delta_len = 0
+
     def send_to_twilio(b64audio: str):
+        nonlocal tw_media_sent, last_delta_len
         sid = stream_info.get("sid")
         if not sid:
-            print("[twilio<-openai] SKIP (no streamSid yet)")
+            log("twilio.media.skip", reason="no_streamSid_yet", preview=b64preview(b64audio))
             return
-        # Normalize base64 payload (safe no-op if already normalized)
+        # Normalize base64 payload (guard against urlsafe or padding issues)
         try:
             payload = base64.b64encode(base64.b64decode(b64audio)).decode("utf-8")
         except Exception:
-            payload = b64audio
+            payload = b64audio  # already normalized or not strictly padded
+        last_delta_len = len(payload)
         try:
             twilio_ws.send(json.dumps({
                 "event": "media",
                 "streamSid": sid,
                 "media": {"payload": payload}
             }))
-        except Exception:
-            pass
+            tw_media_sent += 1
+            # Log first 3 frames, then every 20th to avoid noise
+            if tw_media_sent <= 3 or tw_media_sent % 20 == 0:
+                log("twilio.media.sent",
+                    count=tw_media_sent,
+                    streamSid=sid,
+                    payload_preview=b64preview(payload))
+        except Exception as e:
+            log("twilio.media.error", err=str(e))
 
     try:
         async for raw in openai_ws:
+            oa_events += 1
+            t = None
             try:
                 evt = json.loads(raw)
+                t = evt.get("type")
             except Exception:
+                log("openai.event.parse_error", raw_len=len(raw))
                 continue
 
-            t = evt.get("type")
-            print(f"[openai] evt={t}")
+            # Log the first few events + every 50th event
+            if oa_events <= 5 or oa_events % 50 == 0:
+                log("openai.event", idx=oa_events, type=t)
 
-            # audio delta shapes we care about
+            # Capture errors verbosely
+            if t == "error":
+                log("openai.error", raw=evt)
+                return
+
+            # Accept multiple delta shapes
             b64audio = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64audio = evt.get("delta")
-            if not b64audio and isinstance(evt.get("delta"), dict):
-                b64audio = evt["delta"].get("audio")
-            if not b64audio and isinstance(evt.get("data"), dict):
-                b64audio = evt["data"].get("audio")
-            if not b64audio and t in ("response.output_item.delta", "response.delta"):
+                if isinstance(b64audio, dict):
+                    b64audio = b64audio.get("audio")
+            elif t in ("response.output_item.delta", "response.delta"):
                 maybe = evt.get("delta")
                 if isinstance(maybe, dict):
                     b64audio = maybe.get("audio")
+            elif isinstance(evt.get("data"), dict):
+                b64audio = evt["data"].get("audio")
 
             if b64audio:
+                oa_audio_deltas += 1
+                # Log first 3 deltas + every 20th
+                if oa_audio_deltas <= 3 or oa_audio_deltas % 20 == 0:
+                    log("openai.audio.delta",
+                        idx=oa_audio_deltas,
+                        preview=b64preview(b64audio))
                 send_to_twilio(b64audio)
 
-            if t == "error":
-                try:
-                    print("[openai] ERROR RAW=" + json.dumps(evt))
-                except Exception:
-                    print(f"[openai] ERROR RAW={evt}")
-                return
-    except Exception:
-        pass
+            # When a response completes with zero audio, log it explicitly
+            if t in ("response.completed", "response.done"):
+                if oa_audio_deltas == 0:
+                    log("openai.response.done_no_audio")
+                else:
+                    log("openai.response.done_with_audio", deltas=oa_audio_deltas)
 
+    except Exception as e:
+        log("openai.reader.exception", err=str(e))
+
+    # Graceful stop
     sid = stream_info.get("sid")
     if sid:
         try:
             twilio_ws.send(json.dumps({"event": "stop", "streamSid": sid}))
-        except Exception:
-            pass
+            log("twilio.stop.sent", streamSid=sid)
+        except Exception as e:
+            log("twilio.stop.error", err=str(e))
 
-# --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
