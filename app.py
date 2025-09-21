@@ -114,6 +114,7 @@ async def twilio_to_openai(twilio_ws, openai_ws):
 async def openai_to_twilio(twilio_ws, openai_ws):
     """
     Read audio from OpenAI and send to Twilio as media frames.
+    Handles both response.audio.delta and response.output_audio.delta shapes.
     """
     try:
         async for raw in openai_ws:
@@ -123,24 +124,34 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 continue
 
             t = evt.get("type")
-            b64audio = (
-                evt.get("audio") or
-                _safe_get(evt, "delta", "audio") or
-                _safe_get(evt, "data", "audio")
-            )
+
+            b64audio = None
+            # Most common realtime events for audio
+            if t in ("response.audio.delta", "response.output_audio.delta"):
+                # base64 audio chunk is in 'delta' (string)
+                b64audio = evt.get("delta")
+            else:
+                # Fallbacks seen in some previews
+                b64audio = (
+                    evt.get("audio")
+                    or (evt.get("delta").get("audio") if isinstance(evt.get("delta"), dict) else None)
+                    or (evt.get("data", {}).get("audio") if isinstance(evt.get("data"), dict) else None)
+                )
 
             if b64audio:
-                frame = {"event": "media", "media": {"payload": b64audio}}
                 try:
-                    twilio_ws.send(json.dumps(frame))
+                    twilio_ws.send(json.dumps({"event": "media", "media": {"payload": b64audio}}))
+                    # Optional debug
+                    # print(f"[openai->twilio] sent {len(b64audio)} base64 bytes")
                 except Exception:
                     break
 
-            if t in ("response.completed", "response.stop"):
+            if t in ("response.completed", "response.audio.done", "response.stop"):
                 try:
                     twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
                 except Exception:
                     pass
+                # For MVP, end after a response
                 break
     except Exception:
         pass
@@ -149,6 +160,7 @@ async def openai_to_twilio(twilio_ws, openai_ws):
         twilio_ws.send(json.dumps({"event": "stop"}))
     except Exception:
         pass
+
 
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
