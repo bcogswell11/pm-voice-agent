@@ -134,8 +134,8 @@ def _safe_get(d, *keys, default=None):
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
     Transcode Twilio μ-law 8k -> PCM16 16k, append to OpenAI.
-    Logs: frame counts, decoded bytes, RMS energy, first samples (optional).
-    Commits after ~800ms then triggers response.create.
+    On first commit, also inject a user text item that says what to speak,
+    then trigger response.create. This guarantees TTS even if input audio is silent.
     """
     inbound_frames = 0
     appended_ms = 0.0
@@ -184,51 +184,46 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             b64_ulaw = data.get("media", {}).get("payload", "")
             pcm16k = ulaw8k_to_pcm16_16k(b64_ulaw)
 
-            if inbound_frames <= 3 or inbound_frames % 20 == 0:
-                log("twilio.media.in",
-                    count=inbound_frames,
-                    b64_preview=b64preview(b64_ulaw),
-                    pcm_len=len(pcm16k))
-
-            # energy diagnostics
-            energy = rms_pcm16(pcm16k) if pcm16k else -1
-            diag = {"energy": energy, "pcm_len": len(pcm16k)}
-            if DEBUG_LOG_SAMPLES and pcm16k:
-                try:
-                    import struct
-                    N = min(DEBUG_LOG_SAMPLES, len(pcm16k)//2)
-                    samples = struct.unpack("<" + "h"*N, pcm16k[:2*N])
-                    diag["samples"] = list(samples)
-                except Exception:
-                    pass
-
-            # append if non-empty
+            # append only if we have decoded audio
             if pcm16k:
                 b64_pcm = base64.b64encode(pcm16k).decode("utf-8")
                 try:
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": b64_pcm
+                        "audio": b64_pcm  # base64 of raw PCM16(16k) bytes
                     }))
-                    appended_ms += 20.0  # ~20ms/frame
+                    appended_ms += 20.0  # ~20ms per Twilio frame
                     if inbound_frames <= 3 or inbound_frames % 20 == 0:
-                        log("openai.append.ok",
-                            frames=inbound_frames,
-                            approx_ms=int(appended_ms),
-                            **diag)
+                        log("openai.append.ok", frames=inbound_frames,
+                            approx_ms=int(appended_ms), energy=rms_pcm16(pcm16k), pcm_len=len(pcm16k))
                 except Exception as e:
-                    log("openai.append.error", err=str(e), **diag)
+                    log("openai.append.error", err=str(e))
             else:
                 if inbound_frames <= 3 or inbound_frames % 50 == 0:
-                    log("transcode.empty_or_error", frame=inbound_frames, **diag)
+                    log("transcode.empty_or_error", frame=inbound_frames)
 
-            # commit after ~800ms
+            # Commit once and give the model explicit words to speak
             if not committed and appended_ms >= 800.0:
                 try:
                     await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     log("openai.input.commit", approx_ms=int(appended_ms))
+
+                    # 👉 Inject explicit user message so the model has content to synthesize
+                    await openai_ws.send(json.dumps({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text",
+                                 "text": "Say exactly this one sentence: Hello from Escallop."}
+                            ]
+                        }
+                    }))
+                    log("force.tts.item.sent")
+
                     await openai_ws.send(json.dumps({"type": "response.create"}))
-                    log("response.create.sent_after_commit")
+                    log("response.create.sent_after_commit_with_item")
                     committed = True
                 except Exception as e:
                     log("openai.commit_or_response.error", err=str(e))
