@@ -190,16 +190,16 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # Tell OpenAI to speak in μ-law/8k for Twilio compatibility + request audio modality
-session_update = {
-    "type": "session.update",
-    "session": {
-        "modalities": ["audio"],
-        "voice": OPENAI_VOICE,  # ensure TTS voice is set at session level
-        "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
-        "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
-    }
-}
+        # Tell OpenAI to speak in μ-law/8k for Twilio compatibility + request audio modality + voice
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio"],
+                "voice": OPENAI_VOICE,
+                "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
+                "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
+            }
+        }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] sent session.update for g711_ulaw/8k")
 
@@ -222,9 +222,10 @@ session_update = {
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws))
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws))
 
-      
+        # Wait for either side to finish
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
+        # Clean up
         try:
             loop.run_until_complete(openai_ws.close())
         except Exception:
@@ -238,6 +239,7 @@ session_update = {
             time.sleep(0.05)
     except Exception:
         pass
+
 
 # --- Main (local only) ---
 if __name__ == "__main__":
