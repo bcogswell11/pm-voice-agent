@@ -114,7 +114,7 @@ async def twilio_to_openai(twilio_ws, openai_ws):
 async def openai_to_twilio(twilio_ws, openai_ws):
     """
     Read audio from OpenAI and send to Twilio as media frames.
-    Handles both response.audio.delta and response.output_audio.delta shapes.
+    Handles response.audio.delta / response.output_audio.delta and logs event types.
     """
     try:
         async for raw in openai_ws:
@@ -124,25 +124,30 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 continue
 
             t = evt.get("type")
+            # Debug: see exactly what Realtime is sending
+            try:
+                print(f"[openai] evt={t}")
+            except Exception:
+                pass
 
             b64audio = None
-            # Most common realtime events for audio
+
+            # Most common realtime audio events
             if t in ("response.audio.delta", "response.output_audio.delta"):
-                # base64 audio chunk is in 'delta' (string)
+                # Base64 audio chunk in 'delta' (string)
                 b64audio = evt.get("delta")
-            else:
-                # Fallbacks seen in some previews
+
+            # Fallbacks seen in some previews
+            if not b64audio:
                 b64audio = (
                     evt.get("audio")
-                    or (evt.get("delta").get("audio") if isinstance(evt.get("delta"), dict) else None)
+                    or (evt.get("delta", {}).get("audio") if isinstance(evt.get("delta"), dict) else None)
                     or (evt.get("data", {}).get("audio") if isinstance(evt.get("data"), dict) else None)
                 )
 
             if b64audio:
                 try:
                     twilio_ws.send(json.dumps({"event": "media", "media": {"payload": b64audio}}))
-                    # Optional debug
-                    # print(f"[openai->twilio] sent {len(b64audio)} base64 bytes")
                 except Exception:
                     break
 
@@ -151,7 +156,7 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                     twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
                 except Exception:
                     pass
-                # For MVP, end after a response
+                # For MVP, end after a response; remove 'break' for continuous chatter
                 break
     except Exception:
         pass
