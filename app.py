@@ -275,13 +275,13 @@ def stream(ws):
     def runner():
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
+        log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # --- Minimal GA session.update ---
-        # Keep this VERY small to avoid 'unknown_parameter' issues.
+        # --- GA session.update: REQUIRED session.type = "realtime" ---
         session_update = {
             "type": "session.update",
             "session": {
-                # Ask for audio out; keep voice at the session level.
+                "type": "realtime",                 # <-- REQUIRED (fixes your error)
                 "voice": OPENAI_VOICE or "alloy",
                 "output_modalities": ["audio"],
                 "audio": {
@@ -291,14 +291,17 @@ def stream(ws):
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] sent session.update (GA minimal, audio/pcmu)")
+        log("session.update.sent",
+            voice=OPENAI_VOICE or "alloy",
+            audio_in="audio/pcmu",
+            audio_out="audio/pcmu")
 
-        # Start OpenAI->Twilio reader FIRST so we don't miss early deltas
+        # Start OpenAI->Twilio reader first so we don't miss early deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Put a single user item that forces TTS generation
+        # Force one-sentence TTS
         greet_item = {
             "type": "conversation.item.create",
             "item": {
@@ -311,19 +314,16 @@ def stream(ws):
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
-        print("[stream] sent conversation.item.create (test line)")
+        log("force.tts.item.sent")
 
-        # Trigger the model to respond (no response.modalities in GA)
         loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
-        print("[stream] sent response.create (test)")
+        log("response.create.sent")
 
-        # Now listen for Twilio events (captures streamSid from 'start')
+        # Capture Twilio streamSid and (for now) ignore inbound audio
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
-        # Wait until one side ends
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
-        # Clean up
         try:
             loop.run_until_complete(openai_ws.close())
         except Exception:
