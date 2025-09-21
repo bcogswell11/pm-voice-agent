@@ -277,20 +277,15 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # GA session.update — formats must be OBJECTS, not strings
+        # --- GA session.update (formats as OBJECTS) ---
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "output_modalities": ["audio"],
                 "audio": {
-                    "input":  {
-                        "format": { "type": "audio/pcmu" }   # <-- object
-                    },
-                    "output": {
-                        "format": { "type": "audio/pcmu" },   # <-- object
-                        "voice": (OPENAI_VOICE or "alloy")
-                    }
+                    "input":  {"format": {"type": "audio/pcmu"}},
+                    "output": {"format": {"type": "audio/pcmu"}, "voice": (OPENAI_VOICE or "alloy")}
                 }
             }
         }
@@ -300,30 +295,24 @@ def stream(ws):
             audio_in="audio/pcmu",
             audio_out="audio/pcmu")
 
-        # Start OpenAI->Twilio reader first so we don't miss early deltas
+        # Start OpenAI->Twilio reader FIRST
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Force one-sentence TTS
-        greet_item = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text",
-                     "text": "Say exactly this one sentence: Hello from Escallop."}
-                ]
+        # --- KEY CHANGE: Ask for audio explicitly in response.create ---
+        # No conversation.item.create. We directly create a response with modalities=["audio"].
+        say_exactly = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio"],  # <-- force audio for this response
+                "instructions": "Say exactly this one sentence: Hello from Escallop."
             }
         }
-        loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
-        log("force.tts.item.sent")
+        loop.run_until_complete(openai_ws.send(json.dumps(say_exactly)))
+        log("response.create.sent_explicit_audio")
 
-        loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
-        log("response.create.sent")
-
-        # Capture Twilio streamSid and (for now) ignore inbound audio
+        # Capture Twilio streamSid; we still ignore inbound audio for this smoke test
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -340,7 +329,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
-    
+
 
 
 # --- Main (local only) ---
