@@ -237,27 +237,46 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    Reads OpenAI events; forwards audio deltas to Twilio.
-    Logs per-event counts and previews to confirm audio generation.
+    Read OpenAI PCM16@16k audio deltas, downsample to 8k and convert to μ-law,
+    then send as Twilio media frames (base64 PCMU).
     """
     counts = {}
     tw_media_sent = 0
+    WIDTH = 2
+    CH = 1
+    IN_RATE = 16000
+    OUT_RATE = 8000
 
     def bump(t): counts[t] = counts.get(t, 0) + 1
 
-    def send_to_twilio(b64audio: str):
+    def pcm16_16k_to_ulaw8k(b64_pcm: str) -> str:
+        try:
+            pcm16 = base64.b64decode(b64_pcm)
+            if not pcm16:
+                return ""
+            # 16k -> 8k
+            pcm8k, _ = audioop.ratecv(pcm16, WIDTH, CH, IN_RATE, OUT_RATE, None)
+            # PCM16 -> μ-law
+            ulaw = audioop.lin2ulaw(pcm8k, WIDTH)
+            return base64.b64encode(ulaw).decode("utf-8")
+        except Exception:
+            return ""
+
+    def send_to_twilio_from_pcm(b64_pcm: str):
         nonlocal tw_media_sent
         sid = stream_info.get("sid")
         if not sid:
             log("twilio.media.skip", reason="no_streamSid_yet"); return
+        b64_ulaw = pcm16_16k_to_ulaw8k(b64_pcm)
+        if not b64_ulaw:
+            return
         try:
-            payload = base64.b64encode(base64.b64decode(b64audio)).decode("utf-8")
-        except Exception:
-            payload = b64audio
-        twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":payload}}))
-        tw_media_sent += 1
-        if tw_media_sent <= 3 or tw_media_sent % 20 == 0:
-            log("twilio.media.sent", count=tw_media_sent, payload_preview=b64preview(payload))
+            twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":b64_ulaw}}))
+            tw_media_sent += 1
+            if tw_media_sent <= 3 or tw_media_sent % 20 == 0:
+                log("twilio.media.sent", count=tw_media_sent, payload_preview=b64preview(b64_ulaw))
+        except Exception as e:
+            log("twilio.media.error", err=str(e))
 
     try:
         async for raw in openai_ws:
@@ -271,7 +290,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             if sum(counts.values()) <= 10 or sum(counts.values()) % 50 == 0:
                 log("openai.event", type=t)
 
-            # check various audio delta shapes
+            # Try all known shapes for PCM audio deltas
             b64audio = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64audio = evt.get("delta")
@@ -285,14 +304,23 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 b64audio = evt["data"].get("audio")
 
             if b64audio:
-                send_to_twilio(b64audio)
+                send_to_twilio_from_pcm(b64audio)
 
             if t in ("response.completed", "response.done"):
                 log("openai.response.done_summary",
-                    audio_frames=counts.get("response.output_audio.delta", 0),
+                    audio_frames=counts.get("response.output_audio.delta", 0) + counts.get("response.audio.delta", 0),
                     total_events=sum(counts.values()))
     except Exception as e:
         log("openai.reader.exception", err=str(e))
+
+    # graceful close
+    sid = stream_info.get("sid")
+    if sid:
+        try:
+            twilio_ws.send(json.dumps({"event":"stop","streamSid":sid}))
+        except Exception:
+            pass
+
 
 
 # --- WebSocket: Twilio connects here ---
@@ -310,7 +338,6 @@ def stream(ws):
     loop = asyncio.new_event_loop()
 
     async def heartbeat():
-        # emits once per second so we know the loop is alive
         while True:
             log("hb")
             await asyncio.sleep(DEBUG_HEARTBEAT_MS / 1000.0)
@@ -320,17 +347,24 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # keep your current (PCM16 in @16k, PCMU out) session_update here
-        # (don’t change what you already have working)
-        session_update = {  # ✂️ use the same block you have now
+        # GA session.update:
+        # - INPUT: PCM16 @16k (we already transcode μ-law -> pcm16 in twilio_to_openai)
+        # - OUTPUT: PCM16 @16k (we will transcode -> μ-law for Twilio in openai_to_twilio)
+        session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio","text"],
                 "audio": {
-                    "input":  {"format": {"type": "audio/pcm", "sample_rate_hz": 16000}},
-                    "output": {"format": {"type": "audio/pcmu"}, "voice": (OPENAI_VOICE or "alloy")}
+                    "input": {
+                        "format": {"type": "audio/pcm", "sample_rate_hz": 16000},
+                        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "sample_rate_hz": 16000},
+                        "voice": (OPENAI_VOICE or "alloy")
+                    }
                 },
                 "instructions": "You are a voice agent. Speak concise replies aloud."
             }
@@ -339,9 +373,9 @@ def stream(ws):
         log("session.update.sent",
             voice=OPENAI_VOICE or "alloy",
             audio_in="pcm16@16kHz",
-            audio_out="audio/pcmu")
+            audio_out="pcm16@16kHz",
+            modalities=["audio","text"])
 
-        # start tasks
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
@@ -358,8 +392,6 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
-
-
 
 # --- Main (local only) ---
 if __name__ == "__main__":
