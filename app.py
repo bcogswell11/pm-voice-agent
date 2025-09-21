@@ -79,10 +79,16 @@ def _safe_get(d, *keys, default=None):
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
     Greeting-first test: capture Twilio streamSid and IGNORE input audio.
-    (No input_audio_buffer clear/append/commit here.)
+    Also: make Twilio receive non-blocking so it can't freeze the event loop.
     """
     while True:
-        msg = twilio_ws.receive()
+        # Non-blocking read of Twilio WS
+        try:
+            msg = await asyncio.to_thread(twilio_ws.receive)
+        except Exception:
+            print("[twilio->openai] receive() raised -> break")
+            break
+
         if msg is None:
             print("[twilio->openai] ws.receive() returned None -> break")
             break
@@ -118,11 +124,11 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     return
 
 
-
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
     Read audio deltas from OpenAI and send to Twilio as media frames.
     Always include streamSid. Handles multiple audio event shapes.
+    Also logs short text deltas to confirm the model is replying.
     """
     def send_to_twilio(b64audio: str):
         sid = stream_info.get("sid")
@@ -150,15 +156,15 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             t = evt.get("type")
             print(f"[openai] evt={t}")
 
-            # If it's output text, print a small snippet for visibility
-if t in ("response.output_text.delta", "response.text.delta"):
-    try:
-        snippet = evt.get("delta", "")
-        if isinstance(snippet, dict):
-            snippet = snippet.get("text", "")
-        print(f"[openai] text δ: {str(snippet)[:120]}")
-    except Exception:
-        pass
+            # Text delta visibility (sometimes the model produces both text and audio)
+            if t in ("response.output_text.delta", "response.text.delta"):
+                try:
+                    snippet = evt.get("delta", "")
+                    if isinstance(snippet, dict):
+                        snippet = snippet.get("text", "")
+                    print(f"[openai] text δ: {str(snippet)[:120]}")
+                except Exception:
+                    pass
 
             # If OpenAI reports an error, dump and stop this reader
             if t == "error":
@@ -193,7 +199,7 @@ if t in ("response.output_text.delta", "response.text.delta"):
             if b64audio:
                 send_to_twilio(b64audio)
 
-            # Optional: mark points (include streamSid)
+            # Optional marker; keep socket open
             if t in ("response.completed", "response.audio.done", "response.stop"):
                 sid = stream_info.get("sid")
                 if sid:
@@ -201,7 +207,7 @@ if t in ("response.output_text.delta", "response.text.delta"):
                         twilio_ws.send(json.dumps({"event": "mark", "streamSid": sid, "mark": {"name": "openai_done"}}))
                     except Exception:
                         pass
-                # keep socket open
+                # do not break
     except Exception:
         pass
 
@@ -213,7 +219,7 @@ if t in ("response.output_text.delta", "response.text.delta"):
         except Exception:
             pass
 
-# --- WebSocket: Twilio connects here ---
+
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
