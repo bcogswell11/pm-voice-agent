@@ -105,10 +105,12 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Capture Twilio 'start' (streamSid), count inbound frames,
-    and report unusual Twilio events while we ignore input audio.
+    Pump Twilio media frames into OpenAI:
+      - append base64 PCMU frames with input_audio_buffer.append
+      - after a few frames, commit once and trigger response.create
     """
     inbound_frames = 0
+    committed = False
     last_event = None
 
     while True:
@@ -117,9 +119,8 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
         except Exception as e:
             log("twilio.recv.exception", err=str(e))
             break
-
         if msg is None:
-            log("twilio.recv.none")  # socket closed
+            log("twilio.recv.none")
             break
 
         try:
@@ -130,7 +131,6 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
         evt = data.get("event")
         if evt != last_event:
-            # Log on change to reduce noise
             log("twilio.event", type=evt)
             last_event = evt
 
@@ -140,20 +140,34 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             log("twilio.start", streamSid=sid, track=data.get("start", {}).get("tracks"))
         elif evt == "media":
             inbound_frames += 1
-            # Log first 3 and every 200th inbound media frame
+            payload = data.get("media", {}).get("payload", "")
             if inbound_frames <= 3 or inbound_frames % 200 == 0:
-                payload = data.get("media", {}).get("payload", "")
-                log("twilio.media.in",
-                    count=inbound_frames,
-                    payload_preview=b64preview(payload))
-        elif evt == "mark":
-            log("twilio.mark", name=data.get("mark", {}).get("name"))
+                log("twilio.media.in", count=inbound_frames, payload_preview=b64preview(payload))
+
+            # 1) forward each frame to OpenAI as PCMU base64
+            try:
+                await openai_ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": payload  # base64 PCMU from Twilio
+                }))
+            except Exception as e:
+                log("openai.append.error", err=str(e))
+
+            # 2) after ~30 frames (~375ms), commit once and trigger a response
+            if not committed and inbound_frames >= 30:
+                try:
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    log("openai.input.commit")
+                    await openai_ws.send(json.dumps({"type": "response.create"}))
+                    log("response.create.sent_after_commit")
+                    committed = True
+                except Exception as e:
+                    log("openai.commit_or_response.error", err=str(e))
         elif evt == "stop":
             log("twilio.stop.recv")
             break
         else:
-            # Unknown or less common Twilio events
-            if evt not in ("connected", "heartbeat"):
+            if evt not in ("connected", "heartbeat", "mark"):
                 log("twilio.event.other", raw=data)
 
     return
@@ -277,54 +291,36 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # GA session.update:
-        # - REQUIRED: session.type = "realtime"
-        # - Use "modalities" (NOT "output_modalities")
-        # - Formats must be OBJECTS
-        # - Voice belongs under audio.output.voice
+        # GA session.update matching Twilio’s reference (PCMU + server VAD + voice)
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["audio"],  # <--- key change
+                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                "output_modalities": ["audio"],
                 "audio": {
-                    "input":  {"format": {"type": "audio/pcmu"}},
-                    "output": {"format": {"type": "audio/pcmu"}, "voice": (OPENAI_VOICE or "alloy")}
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {"type": "server_vad"}
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": (OPENAI_VOICE or "alloy")
+                    }
                 },
-                "instructions": "You are a voice agent. Speak replies out loud when possible."
+                "instructions": "You are a voice agent. Speak concise replies aloud."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        log("session.update.sent",
-            voice=OPENAI_VOICE or "alloy",
-            audio_in="audio/pcmu",
-            audio_out="audio/pcmu",
-            modalities="audio")
+        log("session.update.sent", voice=OPENAI_VOICE or "alloy",
+            audio_in="audio/pcmu", audio_out="audio/pcmu")
 
-        # Start the OpenAI->Twilio reader FIRST so we don't miss early audio deltas
+        # Start OpenAI->Twilio reader FIRST so we don't miss early deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # GA pattern: add a user item, then create a response
-        greet_item = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Say exactly this one sentence: Hello from Escallop."}
-                ]
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
-        log("force.tts.item.sent")
-
-        # Minimal trigger — no modalities here
-        loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
-        log("response.create.sent")
-
-        # Capture Twilio streamSid; we still ignore inbound audio for this smoke test
+        # START sending Twilio media → OpenAI; this function now appends, commits, and triggers response.create once.
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -341,7 +337,6 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
-
 
 
 # --- Main (local only) ---
