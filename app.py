@@ -208,8 +208,9 @@ def stream(ws):
         loop.run_until_complete(openai_ws.send(json.dumps(hello)))
 
         # Start relays
-        send_task = loop.create_task(twilio_to_openai(ws, openai_ws))
-        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws))
+        stream_info = {"sid": None}  # holds Twilio streamSid
+        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
 
         # Wait for either side to finish
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
