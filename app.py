@@ -105,13 +105,23 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Pump Twilio media frames into OpenAI input buffer using GA-expected shape:
-      {"type":"input_audio_buffer.append","audio":{"data": "<base64>", "mime_type":"audio/pcmu"}}
-    Then commit after enough frames and trigger response.
+    Forward Twilio PCMU frames into OpenAI:
+      - 'audio' MUST be a base64 STRING of raw bytes (no object)
+      - Normalize Twilio payloads via decode->encode
+      - Commit after enough frames, then trigger response
     """
     inbound_frames = 0
+    appended_frames = 0
     committed = False
     last_event = None
+
+    def normalize_b64(b64s: str) -> str:
+        # Normalize to standard base64 so GA accepts it as bytes
+        try:
+            return base64.b64encode(base64.b64decode(b64s)).decode("utf-8")
+        except Exception:
+            # If decode fails, pass through original (still try)
+            return b64s
 
     while True:
         try:
@@ -143,28 +153,29 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
         elif evt == "media":
             inbound_frames += 1
             payload = data.get("media", {}).get("payload", "")
-
-            # Log first 3 and every 200th inbound media frame
             if inbound_frames <= 3 or inbound_frames % 200 == 0:
                 log("twilio.media.in", count=inbound_frames, payload_preview=b64preview(payload))
 
-            # --- GA APPEND SHAPE (object with data + mime_type) ---
+            norm = normalize_b64(payload)
+
+            # ---- GA expects: {"type":"input_audio_buffer.append", "audio":"<base64-bytes>"} ----
             try:
                 await openai_ws.send(json.dumps({
                     "type": "input_audio_buffer.append",
-                    "audio": {
-                        "data": payload,                 # base64 PCMU from Twilio
-                        "mime_type": "audio/pcmu"        # explicit, even though session declares it
-                    }
+                    "audio": norm
                 }))
+                appended_frames += 1
+                if appended_frames <= 3 or appended_frames % 20 == 0:
+                    log("openai.append.ok", appended=appended_frames, sample_preview=b64preview(norm))
             except Exception as e:
                 log("openai.append.error", err=str(e))
 
-            # Commit after ~60 frames (~0.75s) to guarantee >=100ms seen by GA
-            if not committed and inbound_frames >= 60:
+            # Commit after sufficient frames to guarantee >100ms buffer.
+            # Twilio frames are ~20ms, so 100 frames ≈ 2.0s (very safe).
+            if not committed and appended_frames >= 100:
                 try:
                     await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    log("openai.input.commit", frames=inbound_frames)
+                    log("openai.input.commit", frames=appended_frames)
 
                     await openai_ws.send(json.dumps({"type": "response.create"}))
                     log("response.create.sent_after_commit")
