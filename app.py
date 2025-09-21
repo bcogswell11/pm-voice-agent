@@ -199,36 +199,29 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # GA session: ask for audio out; Twilio uses PCMU (G.711 μ-law) at 8 kHz
+        # --- Minimal GA session.update ---
+        # Keep this VERY small to avoid 'unknown_parameter' issues.
         session_update = {
             "type": "session.update",
             "session": {
-                "type": "realtime",
-                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                # Ask for audio out; keep voice at the session level.
+                "voice": OPENAI_VOICE or "alloy",
                 "output_modalities": ["audio"],
                 "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad"}
-                    },
-                    "output": {
-                        "format": {"type": "audio/pcmu"},
-                        "voice": OPENAI_VOICE or "alloy"
-                    }
-                },
-                "instructions": "Be concise and friendly."
+                    "input":  {"format": "audio/pcmu"},
+                    "output": {"format": "audio/pcmu"}
+                }
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] sent session.update (GA, audio/pcmu)")
+        print("[stream] sent session.update (GA minimal, audio/pcmu)")
 
-        # Start the OpenAI->Twilio reader FIRST so we don't miss audio
-        stream_info = {"sid": None}  # filled from Twilio 'start' in twilio_to_openai
+        # Start OpenAI->Twilio reader FIRST so we don't miss early deltas
+        stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-        loop.run_until_complete(asyncio.sleep(0))  # tiny yield so task is active
+        loop.run_until_complete(asyncio.sleep(0))
 
-        # Minimal one-sentence audio test
-        # 1) Put a user message into the conversation telling the model what to say
+        # Put a single user item that forces TTS generation
         greet_item = {
             "type": "conversation.item.create",
             "item": {
@@ -236,21 +229,21 @@ def stream(ws):
                 "role": "user",
                 "content": [
                     {"type": "input_text",
-                     "text": "Say exactly: Hello! This is a quick audio test."}
+                     "text": "Say exactly this one sentence: Hello from Escallop."}
                 ]
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
         print("[stream] sent conversation.item.create (test line)")
 
-        # 2) Trigger generation (GA: no response.modalities field)
+        # Trigger the model to respond (no response.modalities in GA)
         loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
         print("[stream] sent response.create (test)")
 
-        # Now start the Twilio->OpenAI sender (captures streamSid; we ignore media)
+        # Now listen for Twilio events (captures streamSid from 'start')
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
-        # Wait for both relays to finish
+        # Wait until one side ends
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
         # Clean up
@@ -261,7 +254,6 @@ def stream(ws):
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-
     try:
         while t.is_alive():
             time.sleep(0.05)
