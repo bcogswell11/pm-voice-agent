@@ -221,7 +221,6 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
 
 # --- WebSocket: Twilio connects here ---
-# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     if not OPENAI_API_KEY:
@@ -255,38 +254,37 @@ def stream(ws):
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))  # tiny yield so task is active
 
-        # Send immediate greeting
-       # 1) Add a conversation message the model can respond to
-conv_item = {
-    "type": "conversation.item.create",
-    "item": {
-        "type": "message",
-        "role": "user",
-        "content": [
-            {
-                "type": "input_text",
-                "text": (
-                    "Please greet the caller briefly: "
-                    "Welcome to Escallop Property Management. "
-                    "You can say you take maintenance requests, answer general questions, "
-                    "or forward to a live person."
-                )
+        # 1) Put a message into the conversation that tells the model what to say
+        conv_item = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Please greet the caller briefly: "
+                            "Welcome to Escallop Property Management. "
+                            "You can say you take maintenance requests, answer general questions, "
+                            "or forward to a live person."
+                        )
+                    }
+                ]
             }
-        ]
-    }
-}
-loop.run_until_complete(openai_ws.send(json.dumps(conv_item)))
-print("[stream] sent conversation.item.create (greeting prompt)")
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(conv_item)))
+        print("[stream] sent conversation.item.create (greeting prompt)")
 
-# 2) Ask for a response with audio+text
-hello = {
-    "type": "response.create",
-    "response": {
-        "modalities": ["audio", "text"]  # <- order matters: use ['audio','text']
-    }
-}
-loop.run_until_complete(openai_ws.send(json.dumps(hello)))
-print("[stream] sent response.create (greeting)")
+        # 2) Ask the model to respond in audio + text
+        hello = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio", "text"]  # important: include both
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(hello)))
+        print("[stream] sent response.create (greeting)")
 
         # Now start the Twilio->OpenAI sender
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
@@ -308,7 +306,6 @@ print("[stream] sent response.create (greeting)")
             time.sleep(0.05)
     except Exception:
         pass
-
 
 
 # --- Main (local only) ---
