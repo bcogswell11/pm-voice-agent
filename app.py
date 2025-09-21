@@ -186,11 +186,38 @@ def stream(ws):
 
     def runner():
         asyncio.set_event_loop(loop)
-        openai_ws = loop.run_until_complete(openai_realtime_connect())
+       openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # Kick off two tasks: Twilio->OpenAI and OpenAI->Twilio
-        sender = loop.create_task(relay_twilio_to_openai(ws, openai_ws))
-        receiver = loop.create_task(relay_openai_to_twilio(ws, openai_ws))
+# 1) Say hello immediately so the caller hears a voice
+hello_msg = {
+    "type": "response.create",
+    "response": {
+        "instructions": (
+            "You are a friendly property management assistant. "
+            "Greet the caller briefly and let them know you can take a maintenance request, "
+            "answer general questions, or forward them to a live person if needed."
+        )
+    }
+}
+loop.run_until_complete(openai_ws.send(json.dumps(hello_msg)))
+
+# 2) Periodically commit whatever audio we've received so far so OpenAI can reply mid-call
+async def periodic_commits():
+    try:
+        while True:
+            await asyncio.sleep(1.0)  # every ~1s
+            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            # Ask for a response—OpenAI will decide whether to speak (based on new audio)
+            await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
+    except Exception:
+        pass
+
+commit_task = loop.create_task(periodic_commits())
+
+# 3) Kick off the two relays
+sender = loop.create_task(relay_twilio_to_openai(ws, openai_ws))
+receiver = loop.create_task(relay_openai_to_twilio(ws, openai_ws))
+
 
         # Run both until complete
         gathered = asyncio.gather(sender, receiver, return_exceptions=True)
