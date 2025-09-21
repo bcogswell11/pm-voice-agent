@@ -213,7 +213,6 @@ def stream(ws):
                     "answer general questions, or forward to a live person."
                 ),
                 "modalities": ["audio"],   # ensure audio is produced
-                "audio": { "voice": OPENAI_VOICE }
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(hello)))
