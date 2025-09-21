@@ -277,16 +277,15 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # --- GA session.update: REQUIRED session.type = "realtime" ---
+        # GA session.update — note voice is under audio.output.voice
         session_update = {
             "type": "session.update",
             "session": {
-                "type": "realtime",                 # <-- REQUIRED (fixes your error)
-                "voice": OPENAI_VOICE or "alloy",
+                "type": "realtime",
                 "output_modalities": ["audio"],
                 "audio": {
                     "input":  {"format": "audio/pcmu"},
-                    "output": {"format": "audio/pcmu"}
+                    "output": {"format": "audio/pcmu", "voice": (OPENAI_VOICE or "alloy")}
                 }
             }
         }
