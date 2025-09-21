@@ -8,6 +8,8 @@ import threading
 import time
 import asyncio
 import websockets
+import audioop
+
 
 # --- Config (from Heroku Config Vars) ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -76,8 +78,8 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws):
     """
-    Read Twilio frames and append audio to OpenAI input buffer.
-    Commit only after ~100ms (≈5 frames). Logs show when we append/commit.
+    Read Twilio frames (base64 μ-law/8k), convert to PCM16/8k, and append to OpenAI.
+    Commit only after ~200ms (≈10 frames) to avoid buffer-too-small errors.
     """
     # Start clean each call (supported command)
     try:
@@ -86,8 +88,8 @@ async def twilio_to_openai(twilio_ws, openai_ws):
     except Exception:
         pass
 
-    frame_count = 0            # ~20ms per Twilio frame
-    committed_once = False     # ensure we commit only after enough audio
+    frame_count = 0
+    committed_once = False
 
     while True:
         msg = twilio_ws.receive()
@@ -104,22 +106,33 @@ async def twilio_to_openai(twilio_ws, openai_ws):
         evt = data.get("event")
 
         if evt == "media":
-            payload = data.get("media", {}).get("payload")
-            if payload:
+            payload_b64 = data.get("media", {}).get("payload")
+            if payload_b64:
                 try:
+                    # 1) base64 → bytes (μ-law @ 8k)
+                    mulaw_bytes = base64.b64decode(payload_b64)
+
+                    # 2) μ-law → PCM16 (16-bit little-endian) using stdlib audioop
+                    pcm16_bytes = audioop.ulaw2lin(mulaw_bytes, 2)  # width=2 bytes/sample
+
+                    # 3) bytes → base64 for OpenAI append
+                    pcm16_b64 = base64.b64encode(pcm16_bytes).decode("ascii")
+
+                    # 4) send to OpenAI
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": payload
+                        "audio": pcm16_b64
                     }))
+
                     frame_count += 1
                     if frame_count <= 10 or frame_count % 10 == 0:
-                        print(f"[twilio->openai] append frame #{frame_count}")
-                except Exception:
-                    print("[twilio->openai] append failed -> break")
+                        print(f"[twilio->openai] append(PCM16) frame #{frame_count}")
+                except Exception as e:
+                    print(f"[twilio->openai] append failed -> break ({e})")
                     break
 
-                # Commit after ~5 frames (~100ms) to satisfy Realtime requirement
-                if not committed_once and frame_count >= 5:
+                # Commit after ~10 frames (~200ms) for extra safety
+                if not committed_once and frame_count >= 10:
                     committed_once = True
                     try:
                         print(f"[twilio->openai] COMMIT after frames={frame_count}")
@@ -133,11 +146,12 @@ async def twilio_to_openai(twilio_ws, openai_ws):
             break
 
         else:
-            # Twilio also sends 'start'/'mark' events; ignore them
+            # ignore other Twilio events
             pass
 
-    # Do NOT send any commit here — only commit after enough frames inside the loop.
+    # No trailing commit here.
     return
+
 
 
 async def openai_to_twilio(twilio_ws, openai_ws):
@@ -202,7 +216,7 @@ async def openai_to_twilio(twilio_ws, openai_ws):
 
 
 
-# --- WebSocket: Twilio connects here ---
+
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
@@ -225,8 +239,8 @@ def stream(ws):
             "session": {
                 "modalities": ["audio", "text"],        # text is required with audio
                 "voice": OPENAI_VOICE,                   # alloy/coral/sage/verse/etc.
-                "input_audio_format": "g711_ulaw",       # Twilio μ-law 8k is supported
-                "output_audio_format": "g711_ulaw"
+                "input_audio_format": "pcm16",      # <— was g711_ulaw
+                "output_audio_format": "g711_ulaw"  # keep μ-law for Twilio playback
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
