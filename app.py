@@ -183,6 +183,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     if not OPENAI_API_KEY:
@@ -198,7 +199,7 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # GA session schema: tell server we want AUDIO OUT; Twilio uses PCMU (μ-law)
+        # GA session: ask for audio out; Twilio uses PCMU (G.711 μ-law) at 8 kHz
         session_update = {
             "type": "session.update",
             "session": {
@@ -215,33 +216,44 @@ def stream(ws):
                         "voice": OPENAI_VOICE or "alloy"
                     }
                 },
-                "instructions": "You are a friendly property management assistant."
+                "instructions": "Be concise and friendly."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] sent session.update (GA, audio/pcmu)")
 
-        # Start OpenAI -> Twilio listener FIRST
-        stream_info = {"sid": None}
+        # Start the OpenAI->Twilio reader FIRST so we don't miss audio
+        stream_info = {"sid": None}  # filled from Twilio 'start' in twilio_to_openai
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-        loop.run_until_complete(asyncio.sleep(0))
+        loop.run_until_complete(asyncio.sleep(0))  # tiny yield so task is active
 
-        # One-sentence test: ask for AUDIO ONLY; put the sentence in 'instructions'
-        hello = {
-            "type": "response.create",
-            "response": {
-                "modalities": ["audio"],
-                "instructions": "Test message: You should hear this sentence now."
+        # Minimal one-sentence audio test
+        # 1) Put a user message into the conversation telling the model what to say
+        greet_item = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text",
+                     "text": "Say exactly: Hello! This is a quick audio test."}
+                ]
             }
         }
-        loop.run_until_complete(openai_ws.send(json.dumps(hello)))
-        print("[stream] sent response.create (one-sentence audio)")
+        loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
+        print("[stream] sent conversation.item.create (test line)")
 
-        # Start Twilio -> OpenAI (just to capture streamSid; we ignore media)
+        # 2) Trigger generation (GA: no response.modalities field)
+        loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
+        print("[stream] sent response.create (test)")
+
+        # Now start the Twilio->OpenAI sender (captures streamSid; we ignore media)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
+        # Wait for both relays to finish
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
+        # Clean up
         try:
             loop.run_until_complete(openai_ws.close())
         except Exception:
