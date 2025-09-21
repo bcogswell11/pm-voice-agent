@@ -277,15 +277,20 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # GA session.update — note voice is under audio.output.voice
+        # GA session.update — formats must be OBJECTS, not strings
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "output_modalities": ["audio"],
                 "audio": {
-                    "input":  {"format": "audio/pcmu"},
-                    "output": {"format": "audio/pcmu", "voice": (OPENAI_VOICE or "alloy")}
+                    "input":  {
+                        "format": { "type": "audio/pcmu" }   # <-- object
+                    },
+                    "output": {
+                        "format": { "type": "audio/pcmu" },   # <-- object
+                        "voice": (OPENAI_VOICE or "alloy")
+                    }
                 }
             }
         }
@@ -335,7 +340,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
-
+    
 
 
 # --- Main (local only) ---
