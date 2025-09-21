@@ -114,7 +114,7 @@ async def twilio_to_openai(twilio_ws, openai_ws):
 async def openai_to_twilio(twilio_ws, openai_ws):
     """
     Read audio from OpenAI and send to Twilio as media frames.
-    Handles response.audio.delta / response.output_audio.delta and logs event types.
+    Logs event types and prints the FULL error payload when present.
     """
     try:
         async for raw in openai_ws:
@@ -124,31 +124,25 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 continue
 
             t = evt.get("type")
-            # Debug: see exactly what Realtime is sending
+            # Always log the event type
             try:
                 print(f"[openai] evt={t}")
             except Exception:
                 pass
 
-            # NEW: if OpenAI reports an error, print full details and skip
+            # If OpenAI reports an error, dump the full JSON and stop this reader
             if t == "error":
                 try:
-                    emsg = evt.get("error", {}).get("message")
-                    ecode = evt.get("error", {}).get("code")
-                    print(f"[openai] ERROR: {ecode} - {emsg} | raw={json.dumps(evt)[:500]}")
+                    print("[openai] ERROR RAW=" + json.dumps(evt))
                 except Exception:
-                    print(f"[openai] ERROR raw={evt}")
-                # Don't try to play audio for an error frame
-                continue
+                    print(f"[openai] ERROR RAW={evt}")
+                return  # <-- stop the loop so we don't spam
 
+            # Audio chunk handling
             b64audio = None
-
-            # Most common realtime audio events
             if t in ("response.audio.delta", "response.output_audio.delta"):
-                # Base64 audio chunk in 'delta' (string)
                 b64audio = evt.get("delta")
 
-            # Fallbacks seen in some previews
             if not b64audio:
                 b64audio = (
                     evt.get("audio")
@@ -162,14 +156,13 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 except Exception:
                     break
 
-            # NOTE: don't break on first completion; allow continued responses
+            # Keep the socket open; don't force-break on completion
             if t in ("response.completed", "response.audio.done", "response.stop"):
                 try:
                     twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
                 except Exception:
                     pass
-                # Do NOT break here; keep the WebSocket open for the rest of the call
-                # break
+                # Do not break here
     except Exception:
         pass
 
@@ -177,6 +170,7 @@ async def openai_to_twilio(twilio_ws, openai_ws):
         twilio_ws.send(json.dumps({"event": "stop"}))
     except Exception:
         pass
+
 
 
 # --- WebSocket: Twilio connects here ---
