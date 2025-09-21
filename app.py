@@ -150,6 +150,16 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             t = evt.get("type")
             print(f"[openai] evt={t}")
 
+            # If it's output text, print a small snippet for visibility
+if t in ("response.output_text.delta", "response.text.delta"):
+    try:
+        snippet = evt.get("delta", "")
+        if isinstance(snippet, dict):
+            snippet = snippet.get("text", "")
+        print(f"[openai] text δ: {str(snippet)[:120]}")
+    except Exception:
+        pass
+
             # If OpenAI reports an error, dump and stop this reader
             if t == "error":
                 try:
@@ -235,23 +245,30 @@ def stream(ws):
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] sent session.update (simple, g711_ulaw)")
 
-        # Optional: send an immediate greeting response
-        hello = {
-            "type": "response.create",
-            "response": {
-                "instructions": (
-                    "Welcome to Escallop Property Management. "
-                    "I can take a maintenance request, answer general questions, or forward you to a live person."
-                ),
-                "modalities": ["audio", "text"]
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(hello)))
+       # Relay tasks (start the READER first so we don't miss audio)
+stream_info = {"sid": None}
+recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))  # <-- start listener first
 
-        # Relay tasks — make sure your twilio/openai relay functions accept stream_info
-        stream_info = {"sid": None}  # will be filled from Twilio 'start' event
-        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
-        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
+# (tiny yield so listener is fully running)
+loop.run_until_complete(asyncio.sleep(0))
+
+# Now send the greeting
+hello = {
+    "type": "response.create",
+    "response": {
+        "instructions": (
+            "Welcome to Escallop Property Management. "
+            "I can take a maintenance request, answer general questions, or forward you to a live person."
+        ),
+        "modalities": ["audio", "text"]
+    }
+}
+loop.run_until_complete(openai_ws.send(json.dumps(hello)))
+print("[stream] sent greeting response.create")
+
+# Finally, start the Twilio->OpenAI sender
+send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+
 
         # Wait for either side to finish
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
