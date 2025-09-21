@@ -130,6 +130,17 @@ async def openai_to_twilio(twilio_ws, openai_ws):
             except Exception:
                 pass
 
+            # NEW: if OpenAI reports an error, print full details and skip
+            if t == "error":
+                try:
+                    emsg = evt.get("error", {}).get("message")
+                    ecode = evt.get("error", {}).get("code")
+                    print(f"[openai] ERROR: {ecode} - {emsg} | raw={json.dumps(evt)[:500]}")
+                except Exception:
+                    print(f"[openai] ERROR raw={evt}")
+                # Don't try to play audio for an error frame
+                continue
+
             b64audio = None
 
             # Most common realtime audio events
@@ -151,13 +162,14 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 except Exception:
                     break
 
+            # NOTE: don't break on first completion; allow continued responses
             if t in ("response.completed", "response.audio.done", "response.stop"):
                 try:
                     twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
                 except Exception:
                     pass
-                # For MVP, end after a response; remove 'break' for continuous chatter
-                break
+                # Do NOT break here; keep the WebSocket open for the rest of the call
+                # break
     except Exception:
         pass
 
