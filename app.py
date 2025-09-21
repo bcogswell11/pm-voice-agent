@@ -77,44 +77,61 @@ def _safe_get(d, *keys, default=None):
 async def twilio_to_openai(twilio_ws, openai_ws):
     """
     Read Twilio frames and append audio to OpenAI input buffer.
+    Commit only after ~100ms (≈5 frames) to avoid buffer-too-small errors.
     """
-    # Clear the buffer at the start (supported command)
+    # Start clean each call (supported command)
     try:
         await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
     except Exception:
         pass
-    first_chunk_sent = False
 
+    frame_count = 0            # ~20ms per Twilio frame
+    committed_once = False     # ensure we commit only after enough audio
 
     while True:
         msg = twilio_ws.receive()
         if msg is None:
             break
+
+        # Parse Twilio event
         try:
             data = json.loads(msg)
         except Exception:
             continue
 
         evt = data.get("event")
+
         if evt == "media":
-            payload = _safe_get(data, "media", "payload")
+            payload = data.get("media", {}).get("payload")
             if payload:
-                await openai_ws.send(json.dumps({
-                    "type": "input_audio_buffer.append",
-                    "audio": payload
-                }))
-                if not first_chunk_sent:
-                    first_chunk_sent = True
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
+                # Pass base64 audio straight through to OpenAI
+                try:
+                    await openai_ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": payload
+                    }))
+                except Exception:
+                    break
+
+                frame_count += 1
+
+                # Commit after ~5 frames (~100ms) to satisfy Realtime requirement
+                if not committed_once and frame_count >= 5:
+                    committed_once = True
+                    try:
+                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                        await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
+                        # optional: print for visibility
+                        print(f"[twilio->openai] committed after frames={frame_count}")
+                    except Exception:
+                        pass
+
         elif evt == "stop":
             break
 
-    try:
-        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
-    except Exception:
-        pass
+    # Do NOT force a trailing commit here; it causes buffer-too-small errors if no audio arrived.
+    return
+
 
 async def openai_to_twilio(twilio_ws, openai_ws):
     """
