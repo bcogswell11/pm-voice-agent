@@ -76,10 +76,10 @@ def _safe_get(d, *keys, default=None):
         cur = cur[k]
     return cur
 
-async def twilio_to_openai(twilio_ws, openai_ws):
+async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Greeting-only test: do NOT touch OpenAI's input buffer at all.
-    We just read Twilio events and ignore them. No clear, no append, no commit.
+    Greeting-first test: capture Twilio streamSid and IGNORE input audio.
+    (No input_audio_buffer clear/append/commit here.)
     """
     while True:
         msg = twilio_ws.receive()
@@ -87,25 +87,59 @@ async def twilio_to_openai(twilio_ws, openai_ws):
             print("[twilio->openai] ws.receive() returned None -> break")
             break
 
+        # Parse Twilio event
         try:
             data = json.loads(msg)
         except Exception:
             continue
 
-        if data.get("event") == "stop":
+        evt = data.get("event")
+
+        # Capture streamSid once at call start
+        if evt == "start":
+            try:
+                stream_info["sid"] = data.get("start", {}).get("streamSid")
+                print(f"[twilio] start streamSid={stream_info['sid']}")
+            except Exception:
+                pass
+            continue
+
+        # For this step, ignore 'media' (we're just testing outbound audio)
+        if evt == "media":
+            continue
+
+        if evt == "stop":
             print("[twilio->openai] received stop -> break")
             break
+
+        # ignore other Twilio events
+        continue
 
     return
 
 
 
+async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
+    """
+    Read audio deltas from OpenAI and send to Twilio as media frames.
+    Always include streamSid. Handles multiple audio event shapes.
+    """
+    def send_to_twilio(b64audio: str):
+        sid = stream_info.get("sid")
+        if not sid:
+            # Twilio discards media without streamSid
+            print("[twilio<-openai] SKIP (no streamSid yet)")
+            return
+        msg = {
+            "event": "media",
+            "streamSid": sid,
+            "media": {"payload": b64audio}
+        }
+        try:
+            twilio_ws.send(json.dumps(msg))
+        except Exception:
+            pass
 
-async def openai_to_twilio(twilio_ws, openai_ws):
-    """
-    Read audio from OpenAI and send to Twilio as media frames.
-    Logs event types and prints the FULL error payload when present.
-    """
     try:
         async for raw in openai_ws:
             try:
@@ -114,55 +148,60 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 continue
 
             t = evt.get("type")
-            # Always log the event type
-            try:
-                print(f"[openai] evt={t}")
-            except Exception:
-                pass
+            print(f"[openai] evt={t}")
 
-            # If OpenAI reports an error, dump the full JSON and stop this reader
+            # If OpenAI reports an error, dump and stop this reader
             if t == "error":
                 try:
                     print("[openai] ERROR RAW=" + json.dumps(evt))
                 except Exception:
                     print(f"[openai] ERROR RAW={evt}")
-                return  # <-- stop the loop so we don't spam
+                return
 
-            # Audio chunk handling
+            # Extract audio payload from known shapes
             b64audio = None
+
+            # 1) Common realtime shapes
             if t in ("response.audio.delta", "response.output_audio.delta"):
                 b64audio = evt.get("delta")
 
-            if not b64audio:
-                b64audio = (
-                    evt.get("audio")
-                    or (evt.get("delta", {}).get("audio") if isinstance(evt.get("delta"), dict) else None)
-                    or (evt.get("data", {}).get("audio") if isinstance(evt.get("data"), dict) else None)
-                )
+            # 2) Some previews: 'delta' is an object with 'audio'
+            if not b64audio and isinstance(evt.get("delta"), dict):
+                b64audio = evt["delta"].get("audio")
 
+            # 3) Rare older shapes: 'data' dict contains 'audio'
+            if not b64audio and isinstance(evt.get("data"), dict):
+                b64audio = evt["data"].get("audio")
+
+            # 4) Output-item deltas that carry audio inside delta
+            if not b64audio and t in ("response.output_item.delta", "response.delta"):
+                maybe = evt.get("delta")
+                if isinstance(maybe, dict):
+                    b64audio = maybe.get("audio")
+
+            # Forward audio chunk to Twilio (with streamSid)
             if b64audio:
-                try:
-                    twilio_ws.send(json.dumps({"event": "media", "media": {"payload": b64audio}}))
-                except Exception:
-                    break
+                send_to_twilio(b64audio)
 
-            # Keep the socket open; don't force-break on completion
+            # Optional: mark points (include streamSid)
             if t in ("response.completed", "response.audio.done", "response.stop"):
-                try:
-                    twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
-                except Exception:
-                    pass
-                # Do not break here
+                sid = stream_info.get("sid")
+                if sid:
+                    try:
+                        twilio_ws.send(json.dumps({"event": "mark", "streamSid": sid, "mark": {"name": "openai_done"}}))
+                    except Exception:
+                        pass
+                # keep socket open
     except Exception:
         pass
 
-    try:
-        twilio_ws.send(json.dumps({"event": "stop"}))
-    except Exception:
-        pass
-
-
-
+    # Politely stop Twilio stream when done (if we have sid)
+    sid = stream_info.get("sid")
+    if sid:
+        try:
+            twilio_ws.send(json.dumps({"event": "stop", "streamSid": sid}))
+        except Exception:
+            pass
 
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
