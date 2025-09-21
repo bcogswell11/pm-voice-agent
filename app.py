@@ -197,14 +197,15 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
         # Tell OpenAI to speak in μ-law/8k for Twilio compatibility + request audio modality
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "modalities": ["audio"],
-                "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
-                "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
-            }
-        }
+session_update = {
+    "type": "session.update",
+    "session": {
+        "modalities": ["audio"],
+        "voice": OPENAI_VOICE,  # ensure TTS voice is set at session level
+        "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
+        "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
+    }
+}
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] sent session.update for g711_ulaw/8k")
 
@@ -227,23 +228,9 @@ def stream(ws):
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws))
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws))
 
-        # Periodic commits to encourage mid-call responses
-        async def tick():
-            try:
-                while True:
-                    await asyncio.sleep(1.0)
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
-            except Exception:
-                pass
-
-        tick_task = loop.create_task(tick())
-
+      
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
-        try:
-            tick_task.cancel()
-        except Exception:
-            pass
+
         try:
             loop.run_until_complete(openai_ws.close())
         except Exception:
