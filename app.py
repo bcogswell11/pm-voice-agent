@@ -277,16 +277,17 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # --- GA session.update (formats must be OBJECTS) ---
+        # Session asks for audio globally; formats as OBJECTS; voice under audio.output
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "output_modalities": ["audio"],  # <-- ask for audio globally
+                "output_modalities": ["audio"],
                 "audio": {
                     "input":  {"format": {"type": "audio/pcmu"}},
                     "output": {"format": {"type": "audio/pcmu"}, "voice": (OPENAI_VOICE or "alloy")}
-                }
+                },
+                "instructions": "You are a voice agent. Always speak your replies out loud."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
@@ -295,22 +296,23 @@ def stream(ws):
             audio_in="audio/pcmu",
             audio_out="audio/pcmu")
 
-        # Start OpenAI->Twilio reader FIRST
+        # Start reader first so we don’t miss early deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # --- KEY: no conversation.item.create, no response.modalities here ---
+        # ✅ GA-friendly response.create:
+        #    - modalities at TOP LEVEL (NOT inside "response")
+        #    - instructions at TOP LEVEL too
         say = {
             "type": "response.create",
-            "response": {
-                "instructions": "Say exactly this one sentence: Hello from Escallop."
-            }
+            "modalities": ["audio"],
+            "instructions": "Say exactly this one sentence: Hello from Escallop."
         }
         loop.run_until_complete(openai_ws.send(json.dumps(say)))
-        log("response.create.sent_instructions_only")
+        log("response.create.sent_top_level_modalities")
 
-        # Capture Twilio streamSid; we still ignore inbound audio for this smoke test
+        # Capture Twilio streamSid (we ignore inbound audio for smoke test)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
