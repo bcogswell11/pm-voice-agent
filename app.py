@@ -9,6 +9,27 @@ import time
 import asyncio
 import websockets
 import audioop
+import time
+from datetime import datetime
+
+BOOT_TS = time.monotonic()
+
+def log(tag, **fields):
+    # Compact single-line log with monotonic ms since boot
+    ms = int((time.monotonic() - BOOT_TS) * 1000)
+    parts = [f"[{ms:07d}ms] {tag}"]
+    for k, v in fields.items():
+        try:
+            s = json.dumps(v, separators=(",", ":")) if not isinstance(v, str) else v
+        except Exception:
+            s = str(v)
+        parts.append(f"{k}={s}")
+    print(" ".join(parts))
+
+def b64preview(b64: str, n=16):
+    if not b64:
+        return "∅"
+    return f"{len(b64)}:{b64[:n]}..."
 
 
 # --- Config (from Heroku Config Vars) ---
