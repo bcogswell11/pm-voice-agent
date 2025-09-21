@@ -194,10 +194,10 @@ def stream(ws):
         session_update = {
             "type": "session.update",
             "session": {
-                "modalities": ["audio", "text"],
-                "voice": OPENAI_VOICE,
-                "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
-                "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
+                "modalities": ["audio", "text"],        # text is required with audio
+                "voice": OPENAI_VOICE,                   # alloy/coral/sage/verse/etc.
+                "input_audio_format": "g711_ulaw",       # Twilio μ-law 8k is supported
+                "output_audio_format": "g711_ulaw"
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
