@@ -78,79 +78,26 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws):
     """
-    Read Twilio frames (base64 μ-law/8k), convert to PCM16/8k, and append to OpenAI.
-    Commit only after ~200ms (≈10 frames) to avoid buffer-too-small errors.
+    Greeting-only test: do NOT touch OpenAI's input buffer at all.
+    We just read Twilio events and ignore them. No clear, no append, no commit.
     """
-    # Start clean each call (supported command)
-    try:
-        await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-        print("[twilio->openai] buffer.clear sent")
-    except Exception:
-        pass
-
-    frame_count = 0
-    committed_once = False
-
     while True:
         msg = twilio_ws.receive()
         if msg is None:
             print("[twilio->openai] ws.receive() returned None -> break")
             break
 
-        # Parse Twilio event
         try:
             data = json.loads(msg)
         except Exception:
             continue
 
-        evt = data.get("event")
-
-        if evt == "media":
-            payload_b64 = data.get("media", {}).get("payload")
-            if payload_b64:
-                try:
-                    # 1) base64 → bytes (μ-law @ 8k)
-                    mulaw_bytes = base64.b64decode(payload_b64)
-
-                    # 2) μ-law → PCM16 (16-bit little-endian) using stdlib audioop
-                    pcm16_bytes = audioop.ulaw2lin(mulaw_bytes, 2)  # width=2 bytes/sample
-
-                    # 3) bytes → base64 for OpenAI append
-                    pcm16_b64 = base64.b64encode(pcm16_bytes).decode("ascii")
-
-                    # 4) send to OpenAI
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": pcm16_b64
-                    }))
-
-                    frame_count += 1
-                    if frame_count <= 10 or frame_count % 10 == 0:
-                        print(f"[twilio->openai] append(PCM16) frame #{frame_count}")
-                except Exception as e:
-                    print(f"[twilio->openai] append failed -> break ({e})")
-                    break
-
-                # Commit after ~10 frames (~200ms) for extra safety
-                if not committed_once and frame_count >= 10:
-                    committed_once = True
-                    try:
-                        print(f"[twilio->openai] COMMIT after frames={frame_count}")
-                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                        await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
-                    except Exception:
-                        pass
-
-        elif evt == "stop":
+        if data.get("event") == "stop":
             print("[twilio->openai] received stop -> break")
             break
 
-        else:
-            # ignore other Twilio events
-            pass
-
-    # No trailing commit here.
     return
+
 
 
 
