@@ -1,0 +1,22 @@
+{
+  "name": "Escallop Voice Agent (Minimal Flask)",
+  "description": "Minimal Twilio voice webhook to verify Twilio → Heroku → Flask path.",
+  "keywords": ["python", "flask", "twilio", "voice"],
+  "env": {
+    "TWILIO_ACCOUNT_SID": {
+      "description": "Your Twilio Account SID (optional for this minimal test).",
+      "required": false
+    },
+    "TWILIO_AUTH_TOKEN": {
+      "description": "Your Twilio Auth Token (optional for this minimal test).",
+      "required": false
+    },
+    "OPENAI_API_KEY": {
+      "description": "Your OpenAI API key (not used until Step 3.5).",
+      "required": false
+    }
+  },
+  "formation": { "web": { "quantity": 1 } },
+  "success_url": "/health",
+  "stack": "heroku-24"
+}
