@@ -189,18 +189,23 @@ def stream(ws):
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] sent session.update for g711_ulaw/8k")
 
-        # Immediate greeting so caller hears voice
-        hello = {
-            "type": "response.create",
-            "response": {
-                "instructions": (
-                    "You are a friendly property management assistant. "
-                    "Greet the caller and let them know you can take maintenance requests, "
-                    "answer general questions, or forward to a live person."
-                )
-            }
+# Immediate greeting so caller hears voice
+hello = {
+    "type": "response.create",
+    "response": {
+        "instructions": (
+            "You are a friendly property management assistant. "
+            "Greet the caller and let them know you can take maintenance requests, "
+            "answer general questions, or forward to a live person."
+        ),
+        "modalities": ["audio"],   # <— ensure audio is produced
+        "audio": {
+            "voice": OPENAI_VOICE   # alloy/coral/etc.
+            # (format/sample rate already set via session.update)
         }
-        loop.run_until_complete(openai_ws.send(json.dumps(hello)))
+    }
+}
+loop.run_until_complete(openai_ws.send(json.dumps(hello)))
 
         # Start relays
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws))
