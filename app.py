@@ -58,12 +58,17 @@ def voice_stream_test():
 
 async def openai_realtime_connect():
     """
-    Connect to OpenAI Realtime WS.
+    Connect to OpenAI Realtime WS (GA schema).
+    NOTE: No 'OpenAI-Beta' header here.
     """
-    url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}&voice={OPENAI_VOICE}"
+    # If you set OPENAI_REALTIME_MODEL in Heroku, e.g. 'gpt-realtime', we’ll use it.
+    model = OPENAI_REALTIME_MODEL or "gpt-realtime"
+    url = f"wss://api.openai.com/v1/realtime?model={model}"
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
+        # IMPORTANT: Do NOT include the beta header in GA
+        # "OpenAI-Beta": "realtime=v1",
     }
     ws = await websockets.connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20, max_size=None)
     return ws
@@ -222,6 +227,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     if not OPENAI_API_KEY:
@@ -237,30 +243,44 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # Minimal session schema supported by your endpoint
+        # GA session schema (matches Twilio’s working examples)
         session_update = {
             "type": "session.update",
             "session": {
-                "modalities": ["audio", "text"],   # must include both with this API
-                "voice": OPENAI_VOICE,             # e.g., "alloy"
-                "input_audio_format": "g711_ulaw", # Twilio -> OpenAI
-                "output_audio_format": "g711_ulaw" # OpenAI -> Twilio
+                "type": "realtime",
+                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                "output_modalities": ["audio"],  # tell server we want audio out
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},           # Twilio = G.711 µ-law (pcmu)
+                        "turn_detection": {"type": "server_vad"}    # server VAD
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": OPENAI_VOICE or "alloy"
+                    }
+                },
+                "instructions": (
+                    "You are a friendly property management assistant. "
+                    "Keep replies short and helpful unless asked for details."
+                ),
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] sent session.update (simple, g711_ulaw)")
+        print("[stream] sent session.update (GA, audio/pcmu)")
 
         # Start the OpenAI->Twilio reader FIRST so we don't miss audio
-        stream_info = {"sid": None}  # filled by 'start' event in twilio_to_openai
+        stream_info = {"sid": None}  # filled from Twilio 'start' event
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-        loop.run_until_complete(asyncio.sleep(0))  # tiny yield so task is active
+        loop.run_until_complete(asyncio.sleep(0))  # yield so task is active
 
-        # Send the greeting as a direct response with explicit instructions
+        # Send a greeting as an immediate response (GA: instructions inside response)
         hello = {
             "type": "response.create",
             "response": {
-                # Some deployments only emit audio if text is listed first:
-                "modalities": ["text", "audio"],
+                # GA can stream audio without listing text, but if your account requires both,
+                # you can use ["audio", "text"]. Try audio-only first per GA docs.
+                "modalities": ["audio"],
                 "instructions": (
                     "Welcome to Escallop Property Management. "
                     "I can take a maintenance request, answer general questions, "
@@ -269,15 +289,15 @@ def stream(ws):
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(hello)))
-        print("[stream] sent greeting response.create (text+audio)")
+        print("[stream] sent response.create (greeting)")
 
-        # Now start the Twilio->OpenAI sender (we can keep ignoring input for this test)
+        # Now start the Twilio->OpenAI sender
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         # Wait for both relays to finish
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
-        # Clean up the OpenAI socket
+        # Clean up
         try:
             loop.run_until_complete(openai_ws.close())
         except Exception:
@@ -291,6 +311,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
+
 
 
 # --- Main (local only) ---
