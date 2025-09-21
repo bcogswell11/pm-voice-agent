@@ -277,42 +277,54 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # Session asks for audio globally; formats as OBJECTS; voice under audio.output
+        # GA session.update:
+        # - REQUIRED: session.type = "realtime"
+        # - Use "modalities" (NOT "output_modalities")
+        # - Formats must be OBJECTS
+        # - Voice belongs under audio.output.voice
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "output_modalities": ["audio"],
+                "modalities": ["audio"],  # <--- key change
                 "audio": {
                     "input":  {"format": {"type": "audio/pcmu"}},
                     "output": {"format": {"type": "audio/pcmu"}, "voice": (OPENAI_VOICE or "alloy")}
                 },
-                "instructions": "You are a voice agent. Always speak your replies out loud."
+                "instructions": "You are a voice agent. Speak replies out loud when possible."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         log("session.update.sent",
             voice=OPENAI_VOICE or "alloy",
             audio_in="audio/pcmu",
-            audio_out="audio/pcmu")
+            audio_out="audio/pcmu",
+            modalities="audio")
 
-        # Start reader first so we don’t miss early deltas
+        # Start the OpenAI->Twilio reader FIRST so we don't miss early audio deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # ✅ GA-friendly response.create:
-        #    - modalities at TOP LEVEL (NOT inside "response")
-        #    - instructions at TOP LEVEL too
-        say = {
-            "type": "response.create",
-            "modalities": ["audio"],
-            "instructions": "Say exactly this one sentence: Hello from Escallop."
+        # GA pattern: add a user item, then create a response
+        greet_item = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Say exactly this one sentence: Hello from Escallop."}
+                ]
+            }
         }
-        loop.run_until_complete(openai_ws.send(json.dumps(say)))
-        log("response.create.sent_top_level_modalities")
+        loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
+        log("force.tts.item.sent")
 
-        # Capture Twilio streamSid (we ignore inbound audio for smoke test)
+        # Minimal trigger — no modalities here
+        loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
+        log("response.create.sent")
+
+        # Capture Twilio streamSid; we still ignore inbound audio for this smoke test
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
