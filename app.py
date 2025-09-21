@@ -221,6 +221,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
 
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     if not OPENAI_API_KEY:
@@ -240,7 +241,7 @@ def stream(ws):
         session_update = {
             "type": "session.update",
             "session": {
-                "modalities": ["audio", "text"],   # must include both
+                "modalities": ["audio", "text"],   # must include both with this API
                 "voice": OPENAI_VOICE,             # e.g., "alloy"
                 "input_audio_format": "g711_ulaw", # Twilio -> OpenAI
                 "output_audio_format": "g711_ulaw" # OpenAI -> Twilio
@@ -254,39 +255,23 @@ def stream(ws):
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))  # tiny yield so task is active
 
-        # 1) Put a message into the conversation that tells the model what to say
-        conv_item = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Please greet the caller briefly: "
-                            "Welcome to Escallop Property Management. "
-                            "You can say you take maintenance requests, answer general questions, "
-                            "or forward to a live person."
-                        )
-                    }
-                ]
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(conv_item)))
-        print("[stream] sent conversation.item.create (greeting prompt)")
-
-        # 2) Ask the model to respond in audio + text
+        # Send the greeting as a direct response with explicit instructions
         hello = {
             "type": "response.create",
             "response": {
-                "modalities": ["audio", "text"]  # important: include both
+                # Some deployments only emit audio if text is listed first:
+                "modalities": ["text", "audio"],
+                "instructions": (
+                    "Welcome to Escallop Property Management. "
+                    "I can take a maintenance request, answer general questions, "
+                    "or forward you to a live person."
+                )
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(hello)))
-        print("[stream] sent response.create (greeting)")
+        print("[stream] sent greeting response.create (text+audio)")
 
-        # Now start the Twilio->OpenAI sender
+        # Now start the Twilio->OpenAI sender (we can keep ignoring input for this test)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         # Wait for both relays to finish
