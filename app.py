@@ -220,38 +220,20 @@ def stream(ws):
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # GA Realtime session config (audio in/out for Twilio + server VAD)
         session_update = {
             "type": "session.update",
             "session": {
-                "type": "realtime",
-                "model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime"),
-
-                # We want audio out
-                "output_modalities": ["audio"],
-
-                # Twilio uses PCMU (G.711 μ-law @ 8k) over its Media Streams
-                "audio": {
-                    "input": {
-                        "format": { "type": "audio/pcmu" },
-                        "turn_detection": { "type": "server_vad" }
-                    },
-                    "output": {
-                        "format": { "type": "audio/pcmu" },
-                        "voice": OPENAI_VOICE
-                    }
-                },
-
-                # Session-wide system-style instructions
-                "instructions": (
-                    "You are a friendly property management assistant. "
-                    "Greet the caller and let them know you can take maintenance requests, "
-                    "answer general questions, or forward to a live person."
-                )
+                # Use the minimal, supported fields
+                "modalities": ["audio", "text"],   # MUST include both with this API
+                "voice": OPENAI_VOICE,             # e.g. "alloy"
+                "input_audio_format": "g711_ulaw", # Twilio sends μ-law @ 8k
+                "output_audio_format": "g711_ulaw" # Send μ-law back to Twilio
             }
         }
+
+         
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] sent session.update (GA, audio/pcmu)")
+        print("[stream] sent session.update (simple, g711_ulaw)")
 
         # Optional: send an immediate greeting response
         hello = {
