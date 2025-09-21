@@ -1,1 +1,2 @@
-web: gunicorn app:app --preload --workers=2 --timeout=120
+web: gunicorn app:app --worker-class eventlet -w 1 --timeout=120
+
