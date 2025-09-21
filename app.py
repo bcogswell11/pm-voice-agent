@@ -78,9 +78,7 @@ async def twilio_to_openai(twilio_ws, openai_ws):
     """
     Read Twilio frames and append audio to OpenAI input buffer.
     """
-    # Create audio buffer once
     await openai_ws.send(json.dumps({"type": "input_audio_buffer.create"}))
-
     first_chunk_sent = False
 
     while True:
@@ -96,12 +94,10 @@ async def twilio_to_openai(twilio_ws, openai_ws):
         if evt == "media":
             payload = _safe_get(data, "media", "payload")
             if payload:
-                # Twilio payload is base64 μ-law 8kHz; forward as base64
                 await openai_ws.send(json.dumps({
                     "type": "input_audio_buffer.append",
                     "audio": payload
                 }))
-                # Nudge the model quickly on the first chunk
                 if not first_chunk_sent:
                     first_chunk_sent = True
                     await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
@@ -109,7 +105,6 @@ async def twilio_to_openai(twilio_ws, openai_ws):
         elif evt == "stop":
             break
 
-    # Finalize turn
     try:
         await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
@@ -128,8 +123,6 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                 continue
 
             t = evt.get("type")
-
-            # Many preview variants use one of these fields for base64 audio
             b64audio = (
                 evt.get("audio") or
                 _safe_get(evt, "delta", "audio") or
@@ -137,7 +130,6 @@ async def openai_to_twilio(twilio_ws, openai_ws):
             )
 
             if b64audio:
-                # Send audio back to Twilio
                 frame = {"event": "media", "media": {"payload": b64audio}}
                 try:
                     twilio_ws.send(json.dumps(frame))
@@ -145,17 +137,14 @@ async def openai_to_twilio(twilio_ws, openai_ws):
                     break
 
             if t in ("response.completed", "response.stop"):
-                # Mark for debug and end one response cycle
                 try:
                     twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
                 except Exception:
                     pass
-                # For MVP we end after a response; remove 'break' if you want continuous dialog
                 break
     except Exception:
         pass
 
-    # Tell Twilio we're done
     try:
         twilio_ws.send(json.dumps({"event": "stop"}))
     except Exception:
@@ -164,12 +153,6 @@ async def openai_to_twilio(twilio_ws, openai_ws):
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
-    """
-    Handle a single Twilio Media Stream:
-    - Greet immediately via OpenAI
-    - Relay audio Twilio<->OpenAI
-    """
-    # If no key, bail fast so Twilio doesn't hang
     if not OPENAI_API_KEY:
         try:
             ws.send(json.dumps({"event": "stop"}))
@@ -177,15 +160,24 @@ def stream(ws):
             pass
         return
 
-    # Spin an asyncio loop in a thread so Flask/eventlet can keep serving
     loop = asyncio.new_event_loop()
 
     def runner():
         asyncio.set_event_loop(loop)
-        # Connect to OpenAI
         openai_ws = loop.run_until_complete(openai_realtime_connect())
 
-        # Immediate greeting so caller hears voice right away
+        # Tell OpenAI to speak in μ-law/8k for Twilio compatibility
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
+                "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 }
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
+        print("[stream] sent session.update for g711_ulaw/8k")
+
+        # Immediate greeting so caller hears voice
         hello = {
             "type": "response.create",
             "response": {
@@ -202,7 +194,7 @@ def stream(ws):
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws))
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws))
 
-        # Periodic commits prompt the model to speak during the call
+        # Periodic commits to encourage mid-call responses
         async def tick():
             try:
                 while True:
@@ -214,9 +206,7 @@ def stream(ws):
 
         tick_task = loop.create_task(tick())
 
-        # Run until done
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
-        # Cleanup
         try:
             tick_task.cancel()
         except Exception:
@@ -229,7 +219,6 @@ def stream(ws):
     t = threading.Thread(target=runner, daemon=True)
     t.start()
 
-    # Keep Flask route alive while thread runs
     try:
         while t.is_alive():
             time.sleep(0.05)
