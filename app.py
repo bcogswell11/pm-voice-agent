@@ -3,17 +3,28 @@ from flask import Flask, Response
 from flask_sock import Sock
 import os
 import json
+import base64
+import threading
+import time
+import asyncio
+import websockets
+
+# --- Config (from Heroku Config Vars) ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # --- App setup ---
 app = Flask(__name__)
 sock = Sock(app)
 
-# --- Health check route ---
+# --- Health check ---
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# --- Normal /voice route (Say-only, your working one) ---
+# --- Safe default: Say-only webhook (keeps production stable) ---
 @app.post("/voice")
 def voice():
     twiml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -22,16 +33,15 @@ def voice():
 </Response>"""
     return Response(twiml, mimetype="text/xml")
 
-# --- /voice_stream_test route (only for stream testing) ---
+# --- Streaming test webhook (TwiML) ---
 @app.post("/voice_stream_test")
 def voice_stream_test():
-    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-    if base.startswith("https://"):
-        stream_url = "wss://" + base[len("https://"):] + "/stream"
-    elif base.startswith("http://"):
-        stream_url = "ws://" + base[len("http://"):] + "/stream"
+    # Build secure wss:// URL to our /stream endpoint
+    if PUBLIC_BASE_URL.startswith("https://"):
+        stream_url = "wss://" + PUBLIC_BASE_URL[len("https://"):] + "/stream"
+    elif PUBLIC_BASE_URL.startswith("http://"):
+        stream_url = "ws://" + PUBLIC_BASE_URL[len("http://"):] + "/stream"
     else:
-        # Fallback: your known Heroku URL (keep this updated if app name changes)
         stream_url = "wss://escallop-voice-pm-aa62425200e7.herokuapp.com/stream"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -42,77 +52,190 @@ def voice_stream_test():
 </Response>"""
     return Response(twiml, mimetype="text/xml")
 
-# --- WebSocket /stream route (accepts Twilio Media Stream frames; no audio returned yet) ---
-@sock.route("/stream")
-def stream(ws):
+# ------------- Twilio <-> OpenAI relay helpers -------------
+
+async def openai_realtime_connect():
     """
-    Minimal Twilio Media Streams handler:
-    - Waits for first message to learn the streamSid
-    - Immediately sends a 'mark' back so Twilio knows we're alive
-    - Then keeps reading media frames until 'stop'
-    - Gracefully handles client close without noisy tracebacks
+    Connect to OpenAI Realtime WS.
     """
-    import json
+    url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}&voice={OPENAI_VOICE}"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+    ws = await websockets.connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20, max_size=None)
+    return ws
 
-    stream_sid = None
-    starts = medias = stops = 0
+def _safe_get(d, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
-    try:
-        # Read first message (usually "connected" or "start")
-        first = ws.receive()
-        if first is None:
-            print("[stream] connection closed before first message")
-            return
+async def twilio_to_openai(twilio_ws, openai_ws):
+    """
+    Read Twilio frames and append audio to OpenAI input buffer.
+    """
+    # Create audio buffer once
+    await openai_ws.send(json.dumps({"type": "input_audio_buffer.create"}))
 
+    first_chunk_sent = False
+
+    while True:
+        msg = twilio_ws.receive()
+        if msg is None:
+            break
         try:
-            data = json.loads(first)
+            data = json.loads(msg)
         except Exception:
-            data = {}
+            continue
 
-        stream_sid = data.get("streamSid") or data.get("start", {}).get("streamSid")
         evt = data.get("event")
-
-        if evt == "start":
-            starts += 1
-
-        # Send a quick 'mark' back so Twilio sees a server-originating frame
-        if stream_sid:
-            try:
-                ws.send(json.dumps({
-                    "event": "mark",
-                    "streamSid": stream_sid,
-                    "mark": {"name": "hello_from_server"}
+        if evt == "media":
+            payload = _safe_get(data, "media", "payload")
+            if payload:
+                # Twilio payload is base64 μ-law 8kHz; forward as base64
+                await openai_ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": payload
                 }))
-            except Exception:
-                pass
+                # Nudge the model quickly on the first chunk
+                if not first_chunk_sent:
+                    first_chunk_sent = True
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
+        elif evt == "stop":
+            break
 
-        # Main loop: read frames until 'stop'
-        while True:
-            msg = ws.receive()
-            if msg is None:
-                break
+    # Finalize turn
+    try:
+        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
+    except Exception:
+        pass
+
+async def openai_to_twilio(twilio_ws, openai_ws):
+    """
+    Read audio from OpenAI and send to Twilio as media frames.
+    """
+    try:
+        async for raw in openai_ws:
             try:
-                data = json.loads(msg)
+                evt = json.loads(raw)
             except Exception:
                 continue
 
-            evt = data.get("event")
-            if evt == "media":
-                medias += 1
-            elif evt == "start":
-                starts += 1
-                # update stream_sid if present
-                stream_sid = data.get("streamSid") or stream_sid
-            elif evt == "stop":
-                stops += 1
-                break
+            t = evt.get("type")
 
+            # Many preview variants use one of these fields for base64 audio
+            b64audio = (
+                evt.get("audio") or
+                _safe_get(evt, "delta", "audio") or
+                _safe_get(evt, "data", "audio")
+            )
+
+            if b64audio:
+                # Send audio back to Twilio
+                frame = {"event": "media", "media": {"payload": b64audio}}
+                try:
+                    twilio_ws.send(json.dumps(frame))
+                except Exception:
+                    break
+
+            if t in ("response.completed", "response.stop"):
+                # Mark for debug and end one response cycle
+                try:
+                    twilio_ws.send(json.dumps({"event": "mark", "mark": {"name": "openai_done"}}))
+                except Exception:
+                    pass
+                # For MVP we end after a response; remove 'break' if you want continuous dialog
+                break
     except Exception:
-        # Swallow EOFs and other disconnect noise
         pass
 
-    print(f"[stream] sid={stream_sid} start={starts}, media={medias}, stop={stops}")
-    
-# --- Main (local only; Heroku uses Procfile) ---
+    # Tell Twilio we're done
+    try:
+        twilio_ws.send(json.dumps({"event": "stop"}))
+    except Exception:
+        pass
+
+# --- WebSocket: Twilio connects here ---
+@sock.route("/stream")
+def stream(ws):
+    """
+    Handle a single Twilio Media Stream:
+    - Greet immediately via OpenAI
+    - Relay audio Twilio<->OpenAI
+    """
+    # If no key, bail fast so Twilio doesn't hang
+    if not OPENAI_API_KEY:
+        try:
+            ws.send(json.dumps({"event": "stop"}))
+        except Exception:
+            pass
+        return
+
+    # Spin an asyncio loop in a thread so Flask/eventlet can keep serving
+    loop = asyncio.new_event_loop()
+
+    def runner():
+        asyncio.set_event_loop(loop)
+        # Connect to OpenAI
+        openai_ws = loop.run_until_complete(openai_realtime_connect())
+
+        # Immediate greeting so caller hears voice right away
+        hello = {
+            "type": "response.create",
+            "response": {
+                "instructions": (
+                    "You are a friendly property management assistant. "
+                    "Greet the caller and let them know you can take maintenance requests, "
+                    "answer general questions, or forward to a live person."
+                )
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(hello)))
+
+        # Start relays
+        send_task = loop.create_task(twilio_to_openai(ws, openai_ws))
+        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws))
+
+        # Periodic commits prompt the model to speak during the call
+        async def tick():
+            try:
+                while True:
+                    await asyncio.sleep(1.0)
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    await openai_ws.send(json.dumps({"type": "response.create", "response": {}}))
+            except Exception:
+                pass
+
+        tick_task = loop.create_task(tick())
+
+        # Run until done
+        loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
+        # Cleanup
+        try:
+            tick_task.cancel()
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(openai_ws.close())
+        except Exception:
+            pass
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+    # Keep Flask route alive while thread runs
+    try:
+        while t.is_alive():
+            time.sleep(0.05)
+    except Exception:
+        pass
+
+# --- Main (local only) ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
