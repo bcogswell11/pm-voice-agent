@@ -133,23 +133,22 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Twilio -> OpenAI (server VAD flow)
-    - Capture streamSid
-    - For each Twilio 'media' event, forward the base64 payload as-is
-      to OpenAI using input_audio_buffer.append.
-    - Do NOT call input_audio_buffer.commit. With server_vad, the server
-      commits automatically and will emit input_audio_buffer.speech_started /
-      .speech_stopped / .committed events.
+    Forward Twilio μ-law (audio/pcmu @ 8kHz) frames directly to OpenAI:
+      - append base64 payload as 'audio' (string)
+      - DO NOT call input_audio_buffer.commit; server_vad will commit
     """
     frames = 0
+    last_evt = None
+
     while True:
         try:
             msg = await asyncio.to_thread(twilio_ws.receive)
-        except Exception:
-            print("[twilio->openai] receive() raised -> break")
+        except Exception as e:
+            print(f"[twilio.recv.exception] {e}")
             break
+
         if msg is None:
-            print("[twilio->openai] ws.receive() returned None -> break")
+            print("[twilio] ws.receive() returned None")
             break
 
         try:
@@ -158,91 +157,74 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             continue
 
         evt = data.get("event")
+        if evt != last_evt:
+            print(f"[twilio.event] {evt}")
+            last_evt = evt
+
         if evt == "start":
-            stream_info["sid"] = data.get("start", {}).get("streamSid")
-            print(f"[twilio] start streamSid={stream_info['sid']} track={data.get('start',{}).get('tracks')}")
+            sid = data.get("start", {}).get("streamSid")
+            stream_info["sid"] = sid
+            print(f"[twilio.start] streamSid={sid} tracks={data.get('start',{}).get('tracks')}")
         elif evt == "media":
             payload = data.get("media", {}).get("payload")
             if payload:
+                frames += 1
+                # Optional: log a little to know frames are flowing
+                if frames <= 3 or frames % 50 == 0:
+                    print(f"[twilio.media.in] frames={frames}")
                 try:
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": payload  # base64 audio/pcmu bytes
+                        "audio": payload  # base64 μ-law bytes
                     }))
-                    frames += 1
-                    if frames % 20 == 0:
-                        print(f"[openai.append] frames={frames}")
                 except Exception as e:
-                    print(f"[openai.append] send error: {e}")
+                    print(f"[openai.append.error] {e}")
         elif evt == "stop":
-            print("[twilio] stop")
+            print("[twilio.stop] received")
             break
         # ignore other events
+
+    return
 
 
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    Reads OpenAI events; forwards audio deltas to Twilio.
-    NOW logs full error payloads and previews text deltas so we can see
-    if the model is silently choosing text-only or erroring out.
+    Read OpenAI audio deltas (audio/pcmu @8k), send straight to Twilio as media frames.
     """
-    counts = {}
-    tw_media_sent = 0
-    WIDTH = 2
-    CH = 1
-    IN_RATE = 16000
-    OUT_RATE = 8000
-
-    def bump(t): counts[t] = counts.get(t, 0) + 1
-
-    def pcm16_16k_to_ulaw8k(b64_pcm: str) -> str:
-        try:
-            pcm16 = base64.b64decode(b64_pcm)
-            if not pcm16:
-                return ""
-            pcm8k, _ = audioop.ratecv(pcm16, WIDTH, CH, IN_RATE, OUT_RATE, None)
-            ulaw = audioop.lin2ulaw(pcm8k, WIDTH)
-            return base64.b64encode(ulaw).decode("utf-8")
-        except Exception:
-            return ""
-
-    def send_to_twilio_from_pcm(b64_pcm: str):
-        nonlocal tw_media_sent
+    def send_to_twilio(b64audio: str):
         sid = stream_info.get("sid")
         if not sid:
-            log("twilio.media.skip", reason="no_streamSid_yet"); return
-        b64_ulaw = pcm16_16k_to_ulaw8k(b64_pcm)
-        if not b64_ulaw:
-            log("pcm_to_ulaw.empty"); return
+            print("[twilio<-openai] SKIP (no streamSid yet)")
+            return
+        # normalize base64 (safe if already normalized)
         try:
-            twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":b64_ulaw}}))
-            tw_media_sent += 1
-            if tw_media_sent <= 3 or tw_media_sent % 20 == 0:
-                log("twilio.media.sent", count=tw_media_sent, payload_preview=b64preview(b64_ulaw))
+            payload = base64.b64encode(base64.b64decode(b64audio)).decode("utf-8")
+        except Exception:
+            payload = b64audio
+        try:
+            twilio_ws.send(json.dumps({
+                "event": "media",
+                "streamSid": sid,
+                "media": {"payload": payload}
+            }))
         except Exception as e:
-            log("twilio.media.error", err=str(e))
+            print(f"[twilio.media.error] {e}")
 
     try:
         async for raw in openai_ws:
             try:
                 evt = json.loads(raw)
             except Exception:
-                log("openai.event.parse_error", raw_len=len(raw)); continue
-
-            t = evt.get("type") or "?"
-            bump(t)
-
-            # 🔎 Log full error payloads so we can see the exact reason
-            if t == "error":
-                log("openai.error", raw=evt)   # <-- key addition
                 continue
 
-            # keep an eye on event mix
-            if sum(counts.values()) <= 10 or sum(counts.values()) % 50 == 0:
-                log("openai.event", type=t)
+            t = evt.get("type")
+            if t == "error":
+                # log full error for visibility
+                print("[openai.error]", json.dumps(evt))
+                continue
 
-            # Handle audio deltas (PCM16@16k)
+            # Try all known shapes for audio deltas
             b64audio = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64audio = evt.get("delta")
@@ -256,35 +238,20 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 b64audio = evt["data"].get("audio")
 
             if b64audio:
-                send_to_twilio_from_pcm(b64audio)
+                send_to_twilio(b64audio)
 
-            # 👀 Also log text deltas to see if the model is replying in text-only
-            if t in ("response.output_text.delta", "response.text.delta"):
-                txt = evt.get("delta") or ""
-                if isinstance(txt, dict):
-                    txt = txt.get("text", "")
-                if isinstance(txt, str) and txt:
-                    # log first few and every 20th chunk
-                    if counts[t] <= 3 or counts[t] % 20 == 0:
-                        log("openai.text.delta", preview=(txt[:60] + "..." if len(txt) > 60 else txt))
-
-            if t in ("response.completed", "response.done"):
-                log("openai.response.done_summary",
-                    audio_frames=(counts.get("response.output_audio.delta", 0)
-                                  + counts.get("response.audio.delta", 0)),
-                    text_chunks=(counts.get("response.output_text.delta", 0)
-                                  + counts.get("response.text.delta", 0)),
-                    total_events=sum(counts.values()))
+            if t in ("response.done", "response.completed"):
+                print("[openai] response done")
     except Exception as e:
-        log("openai.reader.exception", err=str(e))
+        print(f"[openai.reader.exception] {e}")
 
-    # graceful stop
     sid = stream_info.get("sid")
     if sid:
         try:
-            twilio_ws.send(json.dumps({"event":"stop","streamSid":sid}))
+            twilio_ws.send(json.dumps({"event": "stop", "streamSid": sid}))
         except Exception:
             pass
+
 
 
 
@@ -304,9 +271,9 @@ def stream(ws):
     def runner():
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
+        print("[stream] openai connected")
 
-        # === IMPORTANT: μ-law (G.711) @ 8k in + out ===
-        # This satisfies Realtime’s requirement for an object format and (for PCM/G.711) an explicit rate.
+        # GA session.update — μ-law (PCMU) @ 8kHz end-to-end
         session_update = {
             "type": "session.update",
             "session": {
@@ -315,39 +282,38 @@ def stream(ws):
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {
-                        "format": {"type": "g711_ulaw", "rate": 8000},
-                        "turn_detection": {"type": "server_vad"}  # auto VAD, will still accept manual commit if you send it
+                        "format": {"type": "audio/pcmu", "rate": 8000},
+                        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
                     },
                     "output": {
-                        "format": {"type": "g711_ulaw", "rate": 8000},
+                        "format": {"type": "audio/pcmu", "rate": 8000},
                         "voice": OPENAI_VOICE or "alloy"
                     }
                 },
-                "instructions": "Be concise and friendly."
+                "instructions": "You are a voice agent. Speak concise replies aloud."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] session.update sent (g711_ulaw @8000)")
+        print("[stream] session.update sent (audio/pcmu @8000 in/out)")
 
-        # Start OpenAI->Twilio pump first so we don’t miss audio
+        # Start OpenAI->Twilio reader FIRST so we don't miss audio
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Force a short audio reply so we can confirm output frames flow
-        greet_item = {
+        # Force a one-line TTS so we can confirm audio deltas flow regardless of input
+        loop.run_until_complete(openai_ws.send(json.dumps({
             "type": "conversation.item.create",
             "item": {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": "Say exactly: Hello! This is a quick audio test."}]
+                "content": [{"type": "input_text", "text": "Say exactly this one sentence: Hello from Escallop."}]
             }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
+        })))
         loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
-        print("[stream] response.create sent (expect audio)")
+        print("[stream] response.create sent (expect audio deltas)")
 
-        # Twilio->OpenAI pump (captures streamSid; you can also append audio here if desired)
+        # Now pump Twilio -> OpenAI (append PCMU payloads; no manual commit — VAD handles it)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -365,6 +331,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
+
 
 
 # --- Main (local only) ---
