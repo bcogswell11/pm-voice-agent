@@ -152,16 +152,16 @@ def _safe_get(d, *keys, default=None):
 
 async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
     """
-    OpenAI -> Twilio (PCM16@24k -> PCMU@8k) with buffering until Twilio streamSid exists.
+    OpenAI -> Twilio (PCM16@24k -> PCMU@8k) with buffering until Twilio streamSid exists,
+    and verbose event logging so we can SEE whether audio deltas arrive.
     """
     import audioop, base64, json, time
 
     WIDTH, CH = 2, 1
     IN_RATE, OUT_RATE = 24000, 8000
 
-    pending_ulaw = []   # buffer deltas that arrive before Twilio gives us streamSid
+    pending_ulaw = []   # buffer deltas arriving before Twilio gives us streamSid
     sent = 0
-    logged_first = False
 
     def to_ulaw8k(b64_pcm16_24k: str) -> str:
         try:
@@ -171,24 +171,24 @@ async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
             pcm8k, _ = audioop.ratecv(pcm16, WIDTH, CH, IN_RATE, OUT_RATE, None)
             ulaw = audioop.lin2ulaw(pcm8k, WIDTH)
             return base64.b64encode(ulaw).decode("utf-8")
-        except Exception:
+        except Exception as e:
+            print(f"[pcmout] transcode.error {e}")
             return ""
 
     def flush_if_ready():
-        nonlocal sent, logged_first
+        nonlocal sent
         sid = stream_info.get("sid")
         if not sid or not pending_ulaw:
             return
-        # trickle buffered frames so Twilio actually plays them
+        # Trickle with ~20ms pacing so Twilio plays smoothly
         while pending_ulaw:
             payload = pending_ulaw.pop(0)
             try:
                 twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":payload}}))
                 sent += 1
-                if not logged_first or sent in (10, 50) or sent % 50 == 0:
+                if sent in (1,2,3,10,25,50) or sent % 50 == 0:
                     print(f"[pcmout] twilio.media.sent count={sent} preview={payload[:24]}...")
-                    logged_first = True
-                time.sleep(0.02)  # ~20ms pacing like Twilio frames
+                time.sleep(0.020)
             except Exception as e:
                 print(f"[pcmout] twilio.media.error {e}")
                 break
@@ -201,15 +201,18 @@ async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
                 continue
 
             t = evt.get("type") or "?"
+            # Verbose diag: show every event type to confirm what the server is sending
+            print(f"[pcmout.diag] openai.event type={t}")
+
             if t == "error":
                 print("[pcmout] openai.error", evt)
                 continue
 
-            # try all known shapes to pull PCM audio
+            # Known audio delta shapes (different docs/sdks use different names)
             b64_pcm = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64_pcm = evt.get("delta")
-                if isinstance(b64_pcm, dict):
+                if isinstance(b64_pcm, dict):  # some SDKs nest "audio"
                     b64_pcm = b64_pcm.get("audio")
             elif t in ("response.output_item.delta", "response.delta"):
                 maybe = evt.get("delta")
@@ -221,20 +224,18 @@ async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
             if b64_pcm:
                 b64_ulaw = to_ulaw8k(b64_pcm)
                 if b64_ulaw:
-                    # buffer until we have a streamSid
                     if not stream_info.get("sid"):
-                        pending_ulaw.append(b64_ulaw)
+                        pending_ulaw.append(b64_ulaw)  # buffer until we have a sid
                     else:
                         pending_ulaw.append(b64_ulaw)
                         flush_if_ready()
 
             if t in ("response.done", "response.completed"):
                 flush_if_ready()
-                print("[pcmout] openai response done (sent_frames=", sent, ")")
+                print(f"[pcmout] openai response done (sent_frames={sent})")
     except Exception as e:
         print(f"[pcmout] openai.reader.exception {e}")
 
-    # final flush if Twilio started late
     flush_if_ready()
     sid = stream_info.get("sid")
     if sid:
@@ -242,7 +243,6 @@ async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
             twilio_ws.send(json.dumps({"event":"stop","streamSid":sid}))
         except Exception:
             pass
-
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
@@ -403,7 +403,9 @@ def stream_pcmout(ws):
       - INPUT to OpenAI: audio/pcmu (forward Twilio frames as-is)
       - OUTPUT from OpenAI: audio/pcm @24k (we transcode to μ-law 8k for Twilio)
       - audio-only, server VAD ON
-      - WAIT for Twilio 'start' (streamSid) before sending response.create
+      - WAIT for Twilio 'start' (streamSid) and then:
+          1) conversation.item.create (user says: "Say exactly: Hello from Escallop.")
+          2) response.create   (no inline instructions)
     """
     import asyncio, json, threading, time
 
@@ -419,20 +421,19 @@ def stream_pcmout(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         print("[pcmout] openai connected")
 
-        # Session: PCMU in, PCM out (24k per your model’s requirement)
         session_update = {
             "type":"session.update",
             "session":{
                 "type":"realtime",
                 "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities":["audio"],
+                "output_modalities":["audio"],  # single modality, per model rules
                 "audio":{
                     "input":{
                         "format": {"type":"audio/pcmu"},
                         "turn_detection": {"type":"server_vad", "silence_duration_ms": 500}
                     },
                     "output":{
-                        "format": {"type":"audio/pcm", "rate": 24000},
+                        "format": {"type":"audio/pcm", "rate": 24000},  # model demanded >=24k
                         "voice": (OPENAI_VOICE or "alloy")
                     }
                 },
@@ -442,12 +443,12 @@ def stream_pcmout(ws):
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[pcmout] session.update sent (in=pcmu, out=pcm@24k)")
 
-        # Start OpenAI->Twilio reader FIRST
+        # Start OpenAI -> Twilio reader FIRST
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio_pcmout(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Twilio -> OpenAI: forward PCMU frames; capture sid ASAP
+        # Twilio -> OpenAI: forward PCMU, capture sid ASAP
         async def twilio_to_openai_pcmu():
             frames = 0
             while True:
@@ -484,23 +485,30 @@ def stream_pcmout(ws):
 
         send_task = loop.create_task(twilio_to_openai_pcmu())
 
-        # ✅ WAIT for Twilio 'start' before triggering TTS (max ~1.5s)
-        for _ in range(75):
+        # ✅ WAIT for Twilio 'start', then message+response
+        for _ in range(100):  # ~2s
             if stream_info.get("sid"):
                 break
             loop.run_until_complete(asyncio.sleep(0.02))
+
         if stream_info.get("sid"):
+            # 1) add a user message to the conversation
             loop.run_until_complete(openai_ws.send(json.dumps({
-                "type":"response.create",
-                "response": { "instructions": "Say exactly: Hello from Escallop." }
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Say exactly: Hello from Escallop." }
+                    ]
+                }
             })))
-            print("[pcmout] response.create sent (after sid)")
+            print("[pcmout] conversation.item.create sent")
+            # 2) trigger response (no inline instructions)
+            loop.run_until_complete(openai_ws.send(json.dumps({ "type": "response.create" })))
+            print("[pcmout] response.create sent")
         else:
-            print("[pcmout] WARN: no streamSid after wait; still proceeding (buffer will flush later)")
-            loop.run_until_complete(openai_ws.send(json.dumps({
-                "type":"response.create",
-                "response": { "instructions": "Say exactly: Hello from Escallop." }
-            })))
+            print("[pcmout] WARN: no streamSid after wait; skipping forced TTS")
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
         try: loop.run_until_complete(openai_ws.close())
@@ -513,7 +521,6 @@ def stream_pcmout(ws):
             time.sleep(0.05)
     except Exception:
         pass
-
 
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
