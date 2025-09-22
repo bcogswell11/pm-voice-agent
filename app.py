@@ -84,6 +84,25 @@ def voice():
 </Response>"""
     return Response(twiml, mimetype="text/xml")
 
+@app.post("/voice_pcmout_test")
+def voice_pcmout_test():
+    base = (PUBLIC_BASE_URL or "https://escallop-voice-pm-aa62425200e7.herokuapp.com").rstrip("/")
+    if base.startswith("https://"):
+        stream_url = "wss://" + base[len("https://"):] + "/stream_pcmout"
+    elif base.startswith("http://"):
+        stream_url = "ws://" + base[len("http://"):] + "/stream_pcmout"
+    else:
+        stream_url = "wss://escallop-voice-pm-aa62425200e7.herokuapp.com/stream_pcmout"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{stream_url}"/>
+  </Connect>
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
+
+
 # --- Streaming test webhook (TwiML) ---
 @app.post("/voice_stream_test")
 def voice_stream_test():
@@ -130,6 +149,83 @@ def _safe_get(d, *keys, default=None):
             return default
         cur = cur[k]
     return cur
+
+async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
+    """
+    Read OpenAI audio deltas as PCM16 @16k, downsample to 8k and convert to μ-law,
+    then send to Twilio as media frames (audio/x-mulaw base64).
+    """
+    import audioop, base64, json
+
+    WIDTH = 2   # 16-bit PCM
+    CH = 1
+    IN_RATE = 16000
+    OUT_RATE = 8000
+    sent = 0
+
+    def to_pc_mu_8k(b64_pcm16_16k: str) -> str:
+        try:
+            pcm16 = base64.b64decode(b64_pcm16_16k)
+            if not pcm16:
+                return ""
+            pcm8k, _ = audioop.ratecv(pcm16, WIDTH, CH, IN_RATE, OUT_RATE, None)
+            ulaw = audioop.lin2ulaw(pcm8k, WIDTH)
+            return base64.b64encode(ulaw).decode("utf-8")
+        except Exception:
+            return ""
+
+    def send_to_twilio(b64_ulaw: str):
+        nonlocal sent
+        sid = stream_info.get("sid")
+        if not sid or not b64_ulaw:
+            return
+        try:
+            twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":b64_ulaw}}))
+            sent += 1
+            if sent in (1,10,50) or sent % 50 == 0:
+                print(f"[pcmout] twilio.media.sent count={sent} preview={b64_ulaw[:24]}...")
+        except Exception as e:
+            print(f"[pcmout] twilio.media.error {e}")
+
+    try:
+        async for raw in openai_ws:
+            try:
+                evt = json.loads(raw)
+            except Exception:
+                continue
+
+            t = evt.get("type") or "?"
+            if t == "error":
+                print("[pcmout] openai.error", evt)
+                continue
+
+            # Grab PCM audio from any known shape
+            b64_pcm = None
+            if t in ("response.output_audio.delta", "response.audio.delta"):
+                b64_pcm = evt.get("delta")
+                if isinstance(b64_pcm, dict):
+                    b64_pcm = b64_pcm.get("audio")
+            elif t in ("response.output_item.delta", "response.delta"):
+                maybe = evt.get("delta")
+                if isinstance(maybe, dict):
+                    b64_pcm = maybe.get("audio")
+            elif isinstance(evt.get("data"), dict):
+                b64_pcm = evt["data"].get("audio")
+
+            if b64_pcm:
+                send_to_twilio(to_pc_mu_8k(b64_pcm))
+
+            if t in ("response.done", "response.completed"):
+                print("[pcmout] openai response done")
+    except Exception as e:
+        print(f"[pcmout] openai.reader.exception {e}")
+
+    sid = stream_info.get("sid")
+    if sid:
+        try:
+            twilio_ws.send(json.dumps({"event":"stop","streamSid":sid}))
+        except Exception:
+            pass
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
@@ -283,6 +379,113 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
 
 # --- WebSocket: Twilio connects here ---
+@sock.route("/stream_pcmout")
+def stream_pcmout(ws):
+    """
+    Separate test path:
+      - INPUT to OpenAI: audio/pcmu (we forward Twilio frames as-is)
+      - OUTPUT from OpenAI: audio/pcm @16k (we transcode to μ-law 8k for Twilio)
+      - audio-only, server VAD ON
+      - trigger a one-line spoken reply via response.create (correct GA schema)
+    """
+    import asyncio, json, threading, time, base64
+
+    if not OPENAI_API_KEY:
+        try: ws.send(json.dumps({"event":"stop"}))
+        except Exception: pass
+        return
+
+    loop = asyncio.new_event_loop()
+
+    def runner():
+        asyncio.set_event_loop(loop)
+        openai_ws = loop.run_until_complete(openai_realtime_connect())
+        print("[pcmout] openai connected")
+
+        # Session: PCMU in, PCM out (16k). (PCM out is widely supported.)
+        session_update = {
+            "type":"session.update",
+            "session":{
+                "type":"realtime",
+                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                "output_modalities":["audio"],
+                "audio":{
+                    "input":{
+                        "format": {"type":"audio/pcmu"},
+                        "turn_detection": {"type":"server_vad", "silence_duration_ms": 500}
+                    },
+                    "output":{
+                        "format": {"type":"audio/pcm", "rate": 16000},
+                        "voice": (OPENAI_VOICE or "alloy")
+                    }
+                },
+                "instructions":"You are a voice agent. Speak out loud; keep replies brief."
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
+        print("[pcmout] session.update sent (in=pcmu, out=pcm@16k)")
+
+        # Start OpenAI->Twilio reader FIRST
+        stream_info = {"sid": None}
+        recv_task = loop.create_task(openai_to_twilio_pcmout(ws, openai_ws, stream_info))
+        loop.run_until_complete(asyncio.sleep(0))
+
+        # Force a spoken line so we don't depend on user speech for the first turn
+        loop.run_until_complete(openai_ws.send(json.dumps({
+            "type":"response.create",
+            "response": { "instructions": "Say exactly: Hello from Escallop." }
+        })))
+        print("[pcmout] response.create sent")
+
+        # Twilio -> OpenAI: forward PCMU frames (no manual commit; VAD will commit)
+        async def twilio_to_openai_pcmu():
+            frames = 0
+            while True:
+                try:
+                    raw = await asyncio.to_thread(ws.receive)
+                except Exception as e:
+                    print(f"[pcmout] twilio.recv.exception {e}"); break
+                if raw is None:
+                    print("[pcmout] twilio ws closed"); break
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+
+                evt = msg.get("event")
+                if evt == "start":
+                    stream_info["sid"] = msg.get("start",{}).get("streamSid")
+                    print(f"[pcmout] twilio.start sid={stream_info['sid']}")
+                elif evt == "media":
+                    frames += 1
+                    if frames in (1,2,3) or frames % 50 == 0:
+                        print(f"[pcmout] twilio.media.in {frames}")
+                    payload = msg.get("media",{}).get("payload")
+                    if payload:
+                        try:
+                            await openai_ws.send(json.dumps({
+                                "type":"input_audio_buffer.append",
+                                "audio": payload
+                            }))
+                        except Exception as e:
+                            print(f"[pcmout] openai.append.error {e}")
+                elif evt == "stop":
+                    print("[pcmout] twilio.stop"); break
+
+        send_task = loop.create_task(twilio_to_openai_pcmu())
+
+        loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
+        try: loop.run_until_complete(openai_ws.close())
+        except Exception: pass
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    try:
+        while t.is_alive():
+            time.sleep(0.05)
+    except Exception:
+        pass
+
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
