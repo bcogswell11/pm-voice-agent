@@ -7,7 +7,7 @@ import asyncio
 import base64
 from datetime import datetime
 
-from flask import Flask, Response
+from flask import Flask, Response, Request
 from flask_sock import Sock
 import websockets
 
@@ -120,6 +120,7 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             payload = data.get("media", {}).get("payload")
             if payload:
                 frames += 1
+                # Light logging so we know frames are flowing
                 if frames <= 3 or frames % 50 == 0:
                     print(f"[twilio.media.in] frames={frames}")
                 try:
@@ -132,6 +133,7 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
         elif evt == "stop":
             print("[twilio.stop] received")
             break
+        # ignore other events
 
     return
 
@@ -159,6 +161,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
         if not sid:
             log_event("twilio.media.skip", reason="no_streamSid_yet")
             return
+        # Normalize base64 (defensive)
         try:
             payload = base64.b64encode(base64.b64decode(b64audio)).decode("utf-8")
         except Exception:
@@ -186,14 +189,14 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 log_event("event", type=t)
 
             if t == "error":
-                log_event("error", raw=evt)
+                log_event("error", raw=evt)  # full payload
                 continue
 
-            # AUDIO DELTAS (with our session set to g711_ulaw)
+            # AUDIO DELTAS (server sends base64 audio — with our session set to g711_ulaw)
             b64audio = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64audio = evt.get("delta")
-                if isinstance(b64audio, dict):
+                if isinstance(b64audio, dict):  # sometimes {"audio": "..."}
                     b64audio = b64audio.get("audio")
             elif t in ("response.output_item.delta", "response.delta"):
                 maybe = evt.get("delta")
@@ -205,7 +208,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             if b64audio:
                 send_to_twilio_pc_mu(b64audio)
 
-            # TEXT DELTAS (handy debug)
+            # TEXT DELTAS (handy to confirm the model is responding)
             if t in ("response.output_text.delta", "response.text.delta"):
                 delta = evt.get("delta")
                 if isinstance(delta, dict):
@@ -256,7 +259,9 @@ def stream(ws):
         session_update = {
             "type": "session.update",
             "session": {
+                # Audio + text is fine; audio is what matters for phone
                 "modalities": ["audio", "text"],
+                # Tell OpenAI what we're sending and what we want back
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": OPENAI_VOICE or "alloy",
@@ -269,7 +274,7 @@ def stream(ws):
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] session.update sent (g711_ulaw in/out, audio+text)")
 
-        # Start OpenAI -> Twilio reader first
+        # Start OpenAI -> Twilio reader first so we never miss audio deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
@@ -277,34 +282,20 @@ def stream(ws):
         # Twilio -> OpenAI (append μ-law frames; NO manual commit — server VAD handles it)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
-        # ✅ Wait for Twilio streamSid, then add a conversation item and create a response with audio
+        # ✅ Wait briefly for Twilio streamSid before asking model to speak
         async def wait_for_sid_then_greet():
             for _ in range(100):  # ~2s total
                 if stream_info.get("sid"):
                     break
                 await asyncio.sleep(0.02)
-
-            # Add a user message to the conversation (so the model has content to respond to)
-            await openai_ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text",
-                         "text": "Greet the caller with: Hello from Escallop."}
-                    ]
-                }
-            }))
-
-            # Create a response, explicitly asking for audio output
+            # Ask model to speak (no response.modalities — session already set)
             await openai_ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio"]
+                    "instructions": "Say exactly: Hello from Escallop."
                 }
             }))
-            print("[stream] conversation.item.create + response.create (audio) sent")
+            print("[stream] response.create sent")
 
         kickoff_task = loop.create_task(wait_for_sid_then_greet())
 
