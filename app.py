@@ -133,105 +133,51 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Transcode Twilio μ-law 8k -> PCM16 16k, append to OpenAI.
-    On first commit, also inject a user text item that says what to speak,
-    then trigger response.create. This guarantees TTS even if input audio is silent.
+    Twilio -> OpenAI (server VAD flow)
+    - Capture streamSid
+    - For each Twilio 'media' event, forward the base64 payload as-is
+      to OpenAI using input_audio_buffer.append.
+    - Do NOT call input_audio_buffer.commit. With server_vad, the server
+      commits automatically and will emit input_audio_buffer.speech_started /
+      .speech_stopped / .committed events.
     """
-    inbound_frames = 0
-    appended_ms = 0.0
-    committed = False
-    last_event = None
-
-    IN_RATE, OUT_RATE, WIDTH, CHANNELS = 8000, 16000, 2, 1
-
-    def ulaw8k_to_pcm16_16k(b64_ulaw: str) -> bytes:
-        try:
-            ulaw = base64.b64decode(b64_ulaw)
-        except Exception:
-            return b""
-        try:
-            pcm8k = audioop.ulaw2lin(ulaw, WIDTH)            # μ-law -> PCM16 @ 8k
-            pcm16k, _ = audioop.ratecv(pcm8k, WIDTH, CHANNELS, IN_RATE, OUT_RATE, None)  # -> 16k
-            return pcm16k
-        except Exception:
-            return b""
-
+    frames = 0
     while True:
         try:
             msg = await asyncio.to_thread(twilio_ws.receive)
-        except Exception as e:
-            log("twilio.recv.exception", err=str(e)); break
+        except Exception:
+            print("[twilio->openai] receive() raised -> break")
+            break
         if msg is None:
-            log("twilio.recv.none"); break
+            print("[twilio->openai] ws.receive() returned None -> break")
+            break
 
         try:
             data = json.loads(msg)
         except Exception:
-            log("twilio.recv.parse_error", msg_preview=str(msg)[:80]); continue
+            continue
 
         evt = data.get("event")
-        if evt != last_event:
-            log("twilio.event", type=evt)
-            last_event = evt
-
         if evt == "start":
-            sid = data.get("start", {}).get("streamSid")
-            stream_info["sid"] = sid
-            log("twilio.start", streamSid=sid, track=data.get("start", {}).get("tracks"))
-
+            stream_info["sid"] = data.get("start", {}).get("streamSid")
+            print(f"[twilio] start streamSid={stream_info['sid']} track={data.get('start',{}).get('tracks')}")
         elif evt == "media":
-            inbound_frames += 1
-            b64_ulaw = data.get("media", {}).get("payload", "")
-            pcm16k = ulaw8k_to_pcm16_16k(b64_ulaw)
-
-            # append only if we have decoded audio
-            if pcm16k:
-                b64_pcm = base64.b64encode(pcm16k).decode("utf-8")
+            payload = data.get("media", {}).get("payload")
+            if payload:
                 try:
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": b64_pcm  # base64 of raw PCM16(16k) bytes
+                        "audio": payload  # base64 audio/pcmu bytes
                     }))
-                    appended_ms += 20.0  # ~20ms per Twilio frame
-                    if inbound_frames <= 3 or inbound_frames % 20 == 0:
-                        log("openai.append.ok", frames=inbound_frames,
-                            approx_ms=int(appended_ms), energy=rms_pcm16(pcm16k), pcm_len=len(pcm16k))
+                    frames += 1
+                    if frames % 20 == 0:
+                        print(f"[openai.append] frames={frames}")
                 except Exception as e:
-                    log("openai.append.error", err=str(e))
-            else:
-                if inbound_frames <= 3 or inbound_frames % 50 == 0:
-                    log("transcode.empty_or_error", frame=inbound_frames)
-
-            # Commit once and give the model explicit words to speak
-            if not committed and appended_ms >= 800.0:
-                try:
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    log("openai.input.commit", approx_ms=int(appended_ms))
-
-                    # 👉 Inject explicit user message so the model has content to synthesize
-                    await openai_ws.send(json.dumps({
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {"type": "input_text",
-                                 "text": "Say exactly this one sentence: Hello from Escallop."}
-                            ]
-                        }
-                    }))
-                    log("force.tts.item.sent")
-
-                    await openai_ws.send(json.dumps({"type": "response.create"}))
-                    log("response.create.sent_after_commit_with_item")
-                    committed = True
-                except Exception as e:
-                    log("openai.commit_or_response.error", err=str(e))
-
+                    print(f"[openai.append] send error: {e}")
         elif evt == "stop":
-            log("twilio.stop.recv"); break
-
-    return
+            print("[twilio] stop")
+            break
+        # ignore other events
 
 
 
