@@ -237,8 +237,9 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    Read OpenAI PCM16@16k audio deltas, downsample to 8k and convert to μ-law,
-    then send as Twilio media frames (base64 PCMU).
+    Reads OpenAI events; forwards audio deltas to Twilio.
+    NOW logs full error payloads and previews text deltas so we can see
+    if the model is silently choosing text-only or erroring out.
     """
     counts = {}
     tw_media_sent = 0
@@ -254,9 +255,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             pcm16 = base64.b64decode(b64_pcm)
             if not pcm16:
                 return ""
-            # 16k -> 8k
             pcm8k, _ = audioop.ratecv(pcm16, WIDTH, CH, IN_RATE, OUT_RATE, None)
-            # PCM16 -> μ-law
             ulaw = audioop.lin2ulaw(pcm8k, WIDTH)
             return base64.b64encode(ulaw).decode("utf-8")
         except Exception:
@@ -269,7 +268,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             log("twilio.media.skip", reason="no_streamSid_yet"); return
         b64_ulaw = pcm16_16k_to_ulaw8k(b64_pcm)
         if not b64_ulaw:
-            return
+            log("pcm_to_ulaw.empty"); return
         try:
             twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":b64_ulaw}}))
             tw_media_sent += 1
@@ -287,10 +286,17 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 
             t = evt.get("type") or "?"
             bump(t)
+
+            # 🔎 Log full error payloads so we can see the exact reason
+            if t == "error":
+                log("openai.error", raw=evt)   # <-- key addition
+                continue
+
+            # keep an eye on event mix
             if sum(counts.values()) <= 10 or sum(counts.values()) % 50 == 0:
                 log("openai.event", type=t)
 
-            # Try all known shapes for PCM audio deltas
+            # Handle audio deltas (PCM16@16k)
             b64audio = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64audio = evt.get("delta")
@@ -306,14 +312,27 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             if b64audio:
                 send_to_twilio_from_pcm(b64audio)
 
+            # 👀 Also log text deltas to see if the model is replying in text-only
+            if t in ("response.output_text.delta", "response.text.delta"):
+                txt = evt.get("delta") or ""
+                if isinstance(txt, dict):
+                    txt = txt.get("text", "")
+                if isinstance(txt, str) and txt:
+                    # log first few and every 20th chunk
+                    if counts[t] <= 3 or counts[t] % 20 == 0:
+                        log("openai.text.delta", preview=(txt[:60] + "..." if len(txt) > 60 else txt))
+
             if t in ("response.completed", "response.done"):
                 log("openai.response.done_summary",
-                    audio_frames=counts.get("response.output_audio.delta", 0) + counts.get("response.audio.delta", 0),
+                    audio_frames=(counts.get("response.output_audio.delta", 0)
+                                  + counts.get("response.audio.delta", 0)),
+                    text_chunks=(counts.get("response.output_text.delta", 0)
+                                  + counts.get("response.text.delta", 0)),
                     total_events=sum(counts.values()))
     except Exception as e:
         log("openai.reader.exception", err=str(e))
 
-    # graceful close
+    # graceful stop
     sid = stream_info.get("sid")
     if sid:
         try:
