@@ -568,13 +568,13 @@ def stream(ws):
         loop.run_until_complete(asyncio.sleep(0))
 
         # ✅ Correct schema: response.create with a nested 'response' object
-        loop.run_until_complete(openai_ws.send(json.dumps({
+        await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
-                "instructions": "Say exactly: Hello from Escallop."
-                # (no modalities here; session is audio-only already)
+                "instructions": "Say exactly: Hello! This is a forced audio probe.",
+                "modalities": ["audio"]
             }
-        })))
+        }))
         print("[stream] response.create (nested response.instructions) sent")
 
         # Twilio -> OpenAI (append PCMU frames; NO manual commit — server VAD handles it)
