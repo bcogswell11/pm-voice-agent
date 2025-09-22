@@ -299,13 +299,13 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         print("[stream] openai connected")
 
-        # PCMU in/out, audio-only (no text), server VAD ON
+        # PCMU in/out, audio-only, server VAD ON
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities": ["audio"],  # <-- required by your model
+                "output_modalities": ["audio"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
@@ -316,25 +316,28 @@ def stream(ws):
                         "voice": OPENAI_VOICE or "alloy"
                     }
                 },
-                "instructions": "You are a voice agent. Always speak replies out loud. Keep them brief."
+                "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] session.update sent (pcmu in/out, audio-only)")
 
-        # Start OpenAI->Twilio first so we don't miss early deltas
+        # Start OpenAI -> Twilio reader first so we don’t miss audio deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Force a spoken reply with inline instructions
+        # ✅ Correct schema: response.create with a nested 'response' object
         loop.run_until_complete(openai_ws.send(json.dumps({
             "type": "response.create",
-            "instructions": "Say exactly: Hello from Escallop."
+            "response": {
+                "instructions": "Say exactly: Hello from Escallop."
+                # (no modalities here; session is audio-only already)
+            }
         })))
-        print("[stream] response.create (inline instructions) sent")
+        print("[stream] response.create (nested response.instructions) sent")
 
-        # Twilio -> OpenAI (append PCMU frames; NO manual commit — VAD will commit)
+        # Twilio -> OpenAI (append PCMU frames; NO manual commit — server VAD handles it)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -351,7 +354,6 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
-
 
 
 # --- Main (local only) ---
