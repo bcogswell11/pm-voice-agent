@@ -292,71 +292,80 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
-    global CALL_TRACE_ID
-    CALL_TRACE_ID = new_trace_id()
-
     if not OPENAI_API_KEY:
-        try: ws.send(json.dumps({"event": "stop"}))
-        except Exception: pass
+        try:
+            ws.send(json.dumps({"event": "stop"}))
+        except Exception:
+            pass
         return
 
     loop = asyncio.new_event_loop()
 
-    async def heartbeat():
-        while True:
-            log("hb")
-            await asyncio.sleep(DEBUG_HEARTBEAT_MS / 1000.0)
-
     def runner():
         asyncio.set_event_loop(loop)
         openai_ws = loop.run_until_complete(openai_realtime_connect())
-        log("openai.connect.ok", model=OPENAI_REALTIME_MODEL or "gpt-realtime")
 
-        # GA session.update:
-        # - INPUT: PCM16 @16k (we already transcode μ-law -> pcm16 in twilio_to_openai)
-        # - OUTPUT: PCM16 @16k (we will transcode -> μ-law for Twilio in openai_to_twilio)
+        # === IMPORTANT: μ-law (G.711) @ 8k in + out ===
+        # This satisfies Realtime’s requirement for an object format and (for PCM/G.711) an explicit rate.
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities": ["audio","text"],
+                "output_modalities": ["audio"],
                 "audio": {
                     "input": {
-                        "format": {"type": "audio/pcm", "sample_rate_hz": 16000},
-                        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
+                        "format": {"type": "g711_ulaw", "rate": 8000},
+                        "turn_detection": {"type": "server_vad"}  # auto VAD, will still accept manual commit if you send it
                     },
                     "output": {
-                        "format": {"type": "audio/pcm", "sample_rate_hz": 16000},
-                        "voice": (OPENAI_VOICE or "alloy")
+                        "format": {"type": "g711_ulaw", "rate": 8000},
+                        "voice": OPENAI_VOICE or "alloy"
                     }
                 },
-                "instructions": "You are a voice agent. Speak concise replies aloud."
+                "instructions": "Be concise and friendly."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        log("session.update.sent",
-            voice=OPENAI_VOICE or "alloy",
-            audio_in="pcm16@16kHz",
-            audio_out="pcm16@16kHz",
-            modalities=["audio","text"])
+        print("[stream] session.update sent (g711_ulaw @8000)")
 
+        # Start OpenAI->Twilio pump first so we don’t miss audio
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
-        hb_task   = loop.create_task(heartbeat())
+        loop.run_until_complete(asyncio.sleep(0))
 
-        loop.run_until_complete(asyncio.gather(send_task, recv_task, hb_task, return_exceptions=True))
-        try: loop.run_until_complete(openai_ws.close())
-        except Exception: pass
+        # Force a short audio reply so we can confirm output frames flow
+        greet_item = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Say exactly: Hello! This is a quick audio test."}]
+            }
+        }
+        loop.run_until_complete(openai_ws.send(json.dumps(greet_item)))
+        loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
+        print("[stream] response.create sent (expect audio)")
+
+        # Twilio->OpenAI pump (captures streamSid; you can also append audio here if desired)
+        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+
+        loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
+
+        try:
+            loop.run_until_complete(openai_ws.close())
+        except Exception:
+            pass
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
+
     try:
         while t.is_alive():
             time.sleep(0.05)
     except Exception:
         pass
+
 
 # --- Main (local only) ---
 if __name__ == "__main__":
