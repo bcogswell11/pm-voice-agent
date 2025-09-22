@@ -539,7 +539,7 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         print("[stream] openai connected")
 
-        # PCMU in/out, audio-only, server VAD ON
+        # Session: PCMU (μ-law) in/out, audio-only, server VAD ON
         session_update = {
             "type": "session.update",
             "session": {
@@ -562,22 +562,22 @@ def stream(ws):
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
         print("[stream] session.update sent (pcmu in/out, audio-only)")
 
-        # Start OpenAI -> Twilio reader first so we don’t miss audio deltas
+        # Start OpenAI -> Twilio reader FIRST so we don't miss early deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # ✅ Correct schema: response.create with a nested 'response' object
-        await openai_ws.send(json.dumps({
+        # Force a spoken reply (per-response options; GA schema requires nested 'response')
+        loop.run_until_complete(openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
                 "instructions": "Say exactly: Hello! This is a forced audio probe.",
                 "modalities": ["audio"]
             }
-        }))
-        print("[stream] response.create (nested response.instructions) sent")
+        })))
+        print("[stream] response.create sent (force audio)")
 
-        # Twilio -> OpenAI (append PCMU frames; NO manual commit — server VAD handles it)
+        # Twilio -> OpenAI (append PCMU frames; NO manual commit — server VAD will commit)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -594,6 +594,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
+
 
 
 # --- Main (local only) ---
