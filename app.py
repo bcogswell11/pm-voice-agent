@@ -273,7 +273,7 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         print("[stream] openai connected")
 
-        # GA session.update — μ-law (PCMU) @ 8kHz end-to-end
+        # PCMU in/out, NO 'rate' field for pcμ-law
         session_update = {
             "type": "session.update",
             "session": {
@@ -282,11 +282,11 @@ def stream(ws):
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {
-                        "format": {"type": "audio/pcmu", "rate": 8000},
+                        "format": {"type": "audio/pcmu"},
                         "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
                     },
                     "output": {
-                        "format": {"type": "audio/pcmu", "rate": 8000},
+                        "format": {"type": "audio/pcmu"},
                         "voice": OPENAI_VOICE or "alloy"
                     }
                 },
@@ -294,14 +294,14 @@ def stream(ws):
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] session.update sent (audio/pcmu @8000 in/out)")
+        print("[stream] session.update sent (audio/pcmu in/out)")
 
         # Start OpenAI->Twilio reader FIRST so we don't miss audio
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Force a one-line TTS so we can confirm audio deltas flow regardless of input
+        # Force a one-line TTS so we can confirm audio deltas flow
         loop.run_until_complete(openai_ws.send(json.dumps({
             "type": "conversation.item.create",
             "item": {
@@ -313,7 +313,7 @@ def stream(ws):
         loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
         print("[stream] response.create sent (expect audio deltas)")
 
-        # Now pump Twilio -> OpenAI (append PCMU payloads; no manual commit — VAD handles it)
+        # Twilio -> OpenAI (append PCMU frames; NO manual commit — VAD will commit)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -331,6 +331,7 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
+
 
 
 
