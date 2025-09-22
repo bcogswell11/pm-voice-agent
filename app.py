@@ -392,136 +392,6 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     except Exception as e:
         print("[openai_to_twilio] exception:", repr(e))
 
-
-
-
-# --- WebSocket: Twilio connects here ---
-@sock.route("/stream_pcmout")
-def stream_pcmout(ws):
-    """
-    Separate test path:
-      - INPUT to OpenAI: audio/pcmu (forward Twilio frames as-is)
-      - OUTPUT from OpenAI: audio/pcm @24k (we transcode to μ-law 8k for Twilio)
-      - audio-only, server VAD ON
-      - WAIT for Twilio 'start' (streamSid) and then:
-          1) conversation.item.create (user says: "Say exactly: Hello from Escallop.")
-          2) response.create   (no inline instructions)
-    """
-    import asyncio, json, threading, time
-
-    if not OPENAI_API_KEY:
-        try: ws.send(json.dumps({"event":"stop"}))
-        except Exception: pass
-        return
-
-    loop = asyncio.new_event_loop()
-
-    def runner():
-        asyncio.set_event_loop(loop)
-        openai_ws = loop.run_until_complete(openai_realtime_connect())
-        print("[pcmout] openai connected")
-
-        session_update = {
-            "type":"session.update",
-            "session":{
-                "type":"realtime",
-                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities":["audio"],  # single modality, per model rules
-                "audio":{
-                    "input":{
-                        "format": {"type":"audio/pcmu"},
-                        "turn_detection": {"type":"server_vad", "silence_duration_ms": 500}
-                    },
-                    "output":{
-                        "format": {"type":"audio/pcm", "rate": 24000},  # model demanded >=24k
-                        "voice": (OPENAI_VOICE or "alloy")
-                    }
-                },
-                "instructions":"You are a voice agent. Speak out loud; keep replies brief."
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[pcmout] session.update sent (in=pcmu, out=pcm@24k)")
-
-        # Start OpenAI -> Twilio reader FIRST
-        stream_info = {"sid": None}
-        recv_task = loop.create_task(openai_to_twilio_pcmout(ws, openai_ws, stream_info))
-        loop.run_until_complete(asyncio.sleep(0))
-
-        # Twilio -> OpenAI: forward PCMU, capture sid ASAP
-        async def twilio_to_openai_pcmu():
-            frames = 0
-            while True:
-                try:
-                    raw = await asyncio.to_thread(ws.receive)
-                except Exception as e:
-                    print(f"[pcmout] twilio.recv.exception {e}"); break
-                if raw is None:
-                    print("[pcmout] twilio ws closed"); break
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-
-                evt = msg.get("event")
-                if evt == "start":
-                    stream_info["sid"] = msg.get("start",{}).get("streamSid")
-                    print(f"[pcmout] twilio.start sid={stream_info['sid']}")
-                elif evt == "media":
-                    frames += 1
-                    if frames in (1,2,3) or frames % 50 == 0:
-                        print(f"[pcmout] twilio.media.in {frames}")
-                    payload = msg.get("media",{}).get("payload")
-                    if payload:
-                        try:
-                            await openai_ws.send(json.dumps({
-                                "type":"input_audio_buffer.append",
-                                "audio": payload
-                            }))
-                        except Exception as e:
-                            print(f"[pcmout] openai.append.error {e}")
-                elif evt == "stop":
-                    print("[pcmout] twilio.stop"); break
-
-        send_task = loop.create_task(twilio_to_openai_pcmu())
-
-        # ✅ WAIT for Twilio 'start', then message+response
-        for _ in range(100):  # ~2s
-            if stream_info.get("sid"):
-                break
-            loop.run_until_complete(asyncio.sleep(0.02))
-
-        if stream_info.get("sid"):
-            # 1) add a user message to the conversation
-            loop.run_until_complete(openai_ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        { "type": "input_text", "text": "Say exactly: Hello from Escallop." }
-                    ]
-                }
-            })))
-            print("[pcmout] conversation.item.create sent")
-            # 2) trigger response (no inline instructions)
-            loop.run_until_complete(openai_ws.send(json.dumps({ "type": "response.create" })))
-            print("[pcmout] response.create sent")
-        else:
-            print("[pcmout] WARN: no streamSid after wait; skipping forced TTS")
-
-        loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
-        try: loop.run_until_complete(openai_ws.close())
-        except Exception: pass
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        while t.is_alive():
-            time.sleep(0.05)
-    except Exception:
-        pass
-
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
@@ -539,7 +409,7 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         print("[stream] openai connected")
 
-        # Session: PCMU (μ-law) in/out, audio-only, server VAD ON
+        # Session: PCMU in/out, audio-only, server VAD ON
         session_update = {
             "type": "session.update",
             "session": {
@@ -567,15 +437,17 @@ def stream(ws):
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Force a spoken reply (per-response options; GA schema requires nested 'response')
+        # Small delay to let session apply before we ask for audio
+        loop.run_until_complete(asyncio.sleep(0.15))
+
+        # Force a spoken reply (GA schema: nested 'response' with only 'instructions')
         loop.run_until_complete(openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
-                "instructions": "Say exactly: Hello! This is a forced audio probe.",
-                "modalities": ["audio"]
+                "instructions": "Say exactly: Hello from Escallop."
             }
         })))
-        print("[stream] response.create sent (force audio)")
+        print("[stream] response.create sent (instructions only)")
 
         # Twilio -> OpenAI (append PCMU frames; NO manual commit — server VAD will commit)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
@@ -594,7 +466,6 @@ def stream(ws):
             time.sleep(0.05)
     except Exception:
         pass
-
 
 
 # --- Main (local only) ---
