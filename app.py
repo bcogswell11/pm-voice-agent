@@ -190,45 +190,60 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    Read OpenAI audio deltas (audio/pcmu @8k), send straight to Twilio as media frames.
+    DIAGNOSTIC VERSION:
+    - Logs every OpenAI event type (first 20, then every 20th)
+    - Logs full error payloads
+    - Logs text deltas (so we can see if the model is replying in text-only)
+    - Forwards audio deltas to Twilio (and logs every 1st/10th/50th media send)
     """
-    def send_to_twilio(b64audio: str):
+    event_count = 0
+    audio_frames = 0
+    text_chunks = 0
+
+    def log_event(tag, **kw):
+        try:
+            print(f"[openai.diag] {tag} " + json.dumps(kw))
+        except Exception:
+            print(f"[openai.diag] {tag} {kw}")
+
+    def send_to_twilio_pc_mu(b64audio: str):
+        nonlocal audio_frames
         sid = stream_info.get("sid")
         if not sid:
-            print("[twilio<-openai] SKIP (no streamSid yet)")
+            log_event("twilio.media.skip", reason="no_streamSid_yet")
             return
-        # normalize base64 (safe if already normalized)
+        # normalize base64 to be safe
         try:
             payload = base64.b64encode(base64.b64decode(b64audio)).decode("utf-8")
         except Exception:
             payload = b64audio
-        try:
-            twilio_ws.send(json.dumps({
-                "event": "media",
-                "streamSid": sid,
-                "media": {"payload": payload}
-            }))
-        except Exception as e:
-            print(f"[twilio.media.error] {e}")
+        twilio_ws.send(json.dumps({"event":"media","streamSid":sid,"media":{"payload":payload}}))
+        audio_frames += 1
+        if audio_frames in (1,10,50) or audio_frames % 50 == 0:
+            log_event("twilio.media.sent", count=audio_frames, payload_preview=(payload[:24] + "..."))
 
     try:
         async for raw in openai_ws:
+            event_count += 1
             try:
                 evt = json.loads(raw)
             except Exception:
+                log_event("event.parse_error", raw_len=len(raw))
                 continue
 
-            t = evt.get("type")
+            t = evt.get("type") or "?"
+            if event_count <= 20 or event_count % 20 == 0:
+                log_event("event", type=t)
+
             if t == "error":
-                # log full error for visibility
-                print("[openai.error]", json.dumps(evt))
+                log_event("error", raw=evt)  # full payload
                 continue
 
-            # Try all known shapes for audio deltas
+            # AUDIO DELTAS (pcmu or pcm—server still sends base64 bytes)
             b64audio = None
             if t in ("response.output_audio.delta", "response.audio.delta"):
                 b64audio = evt.get("delta")
-                if isinstance(b64audio, dict):
+                if isinstance(b64audio, dict):  # some shapes: {"audio": "..."}
                     b64audio = b64audio.get("audio")
             elif t in ("response.output_item.delta", "response.delta"):
                 maybe = evt.get("delta")
@@ -238,17 +253,28 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 b64audio = evt["data"].get("audio")
 
             if b64audio:
-                send_to_twilio(b64audio)
+                send_to_twilio_pc_mu(b64audio)
 
-            if t in ("response.done", "response.completed"):
-                print("[openai] response done")
+            # TEXT DELTAS (to detect text-only replies)
+            if t in ("response.output_text.delta", "response.text.delta"):
+                delta = evt.get("delta")
+                if isinstance(delta, dict):
+                    delta = delta.get("text", "")
+                if isinstance(delta, str) and delta:
+                    text_chunks += 1
+                    if text_chunks <= 5 or text_chunks % 10 == 0:
+                        log_event("text.delta", preview=(delta[:80] + ("..." if len(delta) > 80 else "")))
+
+            if t in ("response.completed", "response.done"):
+                log_event("response.summary", audio_frames=audio_frames, text_chunks=text_chunks, total_events=event_count)
     except Exception as e:
-        print(f"[openai.reader.exception] {e}")
+        log_event("reader.exception", err=str(e))
 
+    # graceful stop
     sid = stream_info.get("sid")
     if sid:
         try:
-            twilio_ws.send(json.dumps({"event": "stop", "streamSid": sid}))
+            twilio_ws.send(json.dumps({"event":"stop","streamSid":sid}))
         except Exception:
             pass
 
