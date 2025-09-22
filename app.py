@@ -159,7 +159,7 @@ async def openai_to_twilio_pcmout(twilio_ws, openai_ws, stream_info):
 
     WIDTH = 2   # 16-bit PCM
     CH = 1
-    IN_RATE = 16000
+    IN_RATE = 24000
     OUT_RATE = 8000
     sent = 0
 
@@ -415,7 +415,7 @@ def stream_pcmout(ws):
                         "turn_detection": {"type":"server_vad", "silence_duration_ms": 500}
                     },
                     "output":{
-                        "format": {"type":"audio/pcm", "rate": 16000},
+                        "format": {"type":"audio/pcm", "rate": 24000},
                         "voice": (OPENAI_VOICE or "alloy")
                     }
                 },
