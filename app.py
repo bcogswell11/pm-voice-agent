@@ -133,64 +133,14 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Twilio -> OpenAI (server VAD flow) + DIAGNOSTIC BEEP:
-      - Forward Twilio μ-law (audio/pcmu @8kHz) frames to OpenAI via input_audio_buffer.append.
-      - Do NOT call input_audio_buffer.commit (server_vad commits automatically).
-      - As soon as Twilio sends 'start', play a 1s 440Hz μ-law beep back to the caller.
+    Forward Twilio μ-law (audio/pcmu @ 8kHz) frames directly to OpenAI:
+      - append base64 payload as 'audio' (string)
+      - DO NOT call input_audio_buffer.commit; server_vad will commit
     """
-    import math, struct, threading, time, base64, json, audioop
-
     frames = 0
     last_evt = None
-    beep_started = False
-
-    def send_beep_once():
-        """
-        Synchronously sends ~1s of μ-law frames back to Twilio (20ms per frame).
-        Runs in a small helper thread so we don't block the receiver loop.
-        """
-        sid = stream_info.get("sid")
-        if not sid:
-            print("[beep] no streamSid yet, skipping"); return
-
-        def _runner():
-            try:
-                sr = 8000           # Hz
-                dur_ms = 1000       # 1 second
-                freq = 440.0        # A4
-                amp = 9000          # amplitude for PCM16
-                samples_total = int(sr * (dur_ms / 1000.0))
-                phase = 0.0
-                step = 2.0 * math.pi * freq / sr
-
-                # Generate and send in 20ms chunks (160 samples)
-                idx = 0
-                while idx < samples_total:
-                    n = min(160, samples_total - idx)  # 20ms @ 8k
-                    pcm = bytearray(2 * n)
-                    for i in range(n):
-                        s = int(amp * math.sin(phase))
-                        struct.pack_into("<h", pcm, 2 * i, s)
-                        phase += step
-                    # PCM16 -> μ-law, then base64 -> Twilio media event
-                    ulaw = audioop.lin2ulaw(bytes(pcm), 2)
-                    payload = base64.b64encode(ulaw).decode("utf-8")
-                    twilio_ws.send(json.dumps({
-                        "event": "media",
-                        "streamSid": sid,
-                        "media": {"payload": payload}
-                    }))
-                    # Pace close to real-time so the call actually plays it
-                    time.sleep(0.020)
-                    idx += n
-                print("[beep] sent 1s tone to Twilio")
-            except Exception as e:
-                print(f"[beep] error: {e}")
-
-        threading.Thread(target=_runner, daemon=True).start()
 
     while True:
-        # Read from Twilio
         try:
             msg = await asyncio.to_thread(twilio_ws.receive)
         except Exception as e:
@@ -201,7 +151,6 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             print("[twilio] ws.receive() returned None")
             break
 
-        # Parse event
         try:
             data = json.loads(msg)
         except Exception:
@@ -216,17 +165,11 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             sid = data.get("start", {}).get("streamSid")
             stream_info["sid"] = sid
             print(f"[twilio.start] streamSid={sid} tracks={data.get('start',{}).get('tracks')}")
-
-            # 🔊 DIAGNOSTIC: play a 1s beep to prove Twilio playback works
-            if not beep_started:
-                beep_started = True
-                send_beep_once()
-
         elif evt == "media":
-            # Forward caller audio frames to OpenAI (server VAD will commit)
             payload = data.get("media", {}).get("payload")
             if payload:
                 frames += 1
+                # Optional: log a little to know frames are flowing
                 if frames <= 3 or frames % 50 == 0:
                     print(f"[twilio.media.in] frames={frames}")
                 try:
@@ -236,7 +179,6 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
                     }))
                 except Exception as e:
                     print(f"[openai.append.error] {e}")
-
         elif evt == "stop":
             print("[twilio.stop] received")
             break
