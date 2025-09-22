@@ -299,13 +299,13 @@ def stream(ws):
         openai_ws = loop.run_until_complete(openai_realtime_connect())
         print("[stream] openai connected")
 
-        # PCMU in/out, NO 'rate' field for pcμ-law
+        # Session: PCMU end-to-end, server VAD ON, allow both audio+text
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities": ["audio"],
+                "output_modalities": ["audio", "text"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
@@ -316,30 +316,25 @@ def stream(ws):
                         "voice": OPENAI_VOICE or "alloy"
                     }
                 },
-                "instructions": "You are a voice agent. Speak concise replies aloud."
+                "instructions": "You are a voice agent. Always speak your replies out loud. Keep them brief."
             }
         }
         loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] session.update sent (audio/pcmu in/out)")
+        print("[stream] session.update sent (pcmu in/out, audio+text)")
 
-        # Start OpenAI->Twilio reader FIRST so we don't miss audio
+        # Start OpenAI->Twilio first so we don't miss early deltas
         stream_info = {"sid": None}
         recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         loop.run_until_complete(asyncio.sleep(0))
 
-        # Force a one-line TTS so we can confirm audio deltas flow
+        # 🔊 Force a spoken reply with inline instructions (no conversation.item.create)
         loop.run_until_complete(openai_ws.send(json.dumps({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Say exactly this one sentence: Hello from Escallop."}]
-            }
+            "type": "response.create",
+            "instructions": "Say exactly: Hello from Escallop."
         })))
-        loop.run_until_complete(openai_ws.send(json.dumps({"type": "response.create"})))
-        print("[stream] response.create sent (expect audio deltas)")
+        print("[stream] response.create (inline instructions) sent")
 
-        # Twilio -> OpenAI (append PCMU frames; NO manual commit — VAD will commit)
+        # Begin Twilio->OpenAI append loop (no manual commit; VAD will commit)
         send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
         loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
@@ -351,12 +346,12 @@ def stream(ws):
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
-
     try:
         while t.is_alive():
             time.sleep(0.05)
     except Exception:
         pass
+
 
 
 
