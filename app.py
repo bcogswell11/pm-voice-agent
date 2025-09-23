@@ -120,13 +120,12 @@ def voice_pcmout_test():
 def voice_stream_test():
     # Build secure wss:// URL to our /stream endpoint
     if PUBLIC_BASE_URL.startswith("https://"):
-        base = PUBLIC_BASE_URL
         stream_url = "wss://" + PUBLIC_BASE_URL[len("https://"):] + "/stream"
-    elif PUBLIC_BASE_URL.startswith("http://"):
         base = PUBLIC_BASE_URL
+    elif PUBLIC_BASE_URL.startswith("http://"):
         stream_url = "ws://" + PUBLIC_BASE_URL[len("http://"):] + "/stream"
+        base = PUBLIC_BASE_URL
     else:
-        # fallback to your Heroku base
         base = "https://escallop-voice-pm-aa62425200e7.herokuapp.com"
         stream_url = "wss://escallop-voice-pm-aa62425200e7.herokuapp.com/stream"
 
@@ -135,10 +134,11 @@ def voice_stream_test():
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{stream_url}" statusCallback="{status_url}" statusCallbackMethod="POST"/>
+    <Stream url="{stream_url}" track="both" statusCallback="{status_url}" statusCallbackMethod="POST"/>
   </Connect>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
+
 
 
 # ------------- Twilio <-> OpenAI relay helpers -------------
