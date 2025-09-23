@@ -152,22 +152,18 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Forward Twilio μ-law (audio/pcmu @ 8kHz) frames directly to OpenAI.
-    NEW: Immediately after 'start', send brief μ-law silence to Twilio for ~2s to
-    keep the stream open on carriers that hang up if no outbound media appears.
+    Forward Twilio μ-law (audio/pcmu @ 8kHz) frames to OpenAI.
+    NEW: Immediately on 'start', synchronously send a short burst of μ-law silence
+    (10 x 20ms frames) BEFORE yielding control, so Twilio sees outbound media
+    and does not auto-stop the stream.
     """
-    import base64, json, asyncio, time
+    import base64, json, asyncio
 
     frames = 0
     last_evt = None
-    sent_silence_until = 0.0  # monotonic deadline to send silence frames
-    silence_payload_b64 = None
 
-    # prepare 20ms of μ-law silence @ 8kHz: 160 bytes of 0xFF
-    try:
-        silence_payload_b64 = base64.b64encode(b"\xFF" * 160).decode("utf-8")
-    except Exception:
-        silence_payload_b64 = None  # should never happen
+    # 20ms of μ-law silence @8kHz => 160 bytes of 0xFF
+    SILENCE_B64 = base64.b64encode(b"\xFF" * 160).decode("utf-8")
 
     async def safe_send(obj):
         def _send():
@@ -176,19 +172,6 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             await asyncio.to_thread(_send)
         except Exception as e:
             print(f"[twilio.send.error] {e}")
-
-    async def trickle_silence_if_needed():
-        # Send 1 silent 20ms frame every 200ms until the deadline passes.
-        while time.monotonic() < sent_silence_until:
-            sid = stream_info.get("sid")
-            if sid and silence_payload_b64:
-                await safe_send({
-                    "event":"media",
-                    "streamSid": sid,
-                    "media":{"payload": silence_payload_b64}
-                })
-                print("[twilio.keepalive] silent frame sent")
-            await asyncio.sleep(0.20)
 
     while True:
         try:
@@ -216,10 +199,14 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
             stream_info["sid"] = sid
             print(f"[twilio.start] streamSid={sid} tracks={data.get('start',{}).get('tracks')}")
 
-            # Hold the call open: send μ-law silence for ~2 seconds.
-            sent_silence_until = time.monotonic() + 2.0
-            # Fire-and-forget the silence trickle
-            asyncio.create_task(trickle_silence_if_needed())
+            # --- INLINE BURST: send 10 silent frames immediately (no delay) ---
+            if sid:
+                payload = {"event":"media","streamSid":sid,"media":{"payload":SILENCE_B64}}
+                for i in range(10):  # 10 * 20ms = 200ms of outbound media
+                    await safe_send(payload)
+                # also drop a 'mark' for good measure
+                await safe_send({"event":"mark","streamSid":sid,"mark":{"name":"primed"}})
+            # -------------------------------------------------------------------
 
         elif evt == "media":
             payload = data.get("media", {}).get("payload")
@@ -238,7 +225,6 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
         elif evt == "stop":
             print("[twilio.stop] received")
             break
-        # ignore other events
 
     return
 
