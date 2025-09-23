@@ -344,13 +344,17 @@ def stream(ws):
             pass
         return
 
-    async def async_runner():
+    loop = asyncio.new_event_loop()
+
+    def runner():
+        asyncio.set_event_loop(loop)
+        openai_ws = None
         try:
-            # 1) Connect to OpenAI Realtime WS
-            openai_ws = await openai_realtime_connect()
+            # 1) Connect to OpenAI Realtime
+            openai_ws = loop.run_until_complete(openai_realtime_connect())
             print("[stream] openai connected")
 
-            # 2) Apply session (PCMU in/out, audio-only for now)
+            # 2) Apply session (PCMU in/out, audio-only)
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -370,44 +374,54 @@ def stream(ws):
                     "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
                 }
             }
-            await openai_ws.send(json.dumps(session_update))
+            loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
             print("[stream] session.update sent (pcmu in/out, audio-only)")
 
-            # 3) Start OpenAI -> Twilio FIRST
+            # 3) Start OpenAI->Twilio first so we don't miss early deltas
             stream_info = {"sid": None}
-            recv_task = asyncio.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-            await asyncio.sleep(0)
+            recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
+            loop.run_until_complete(asyncio.sleep(0))
 
-            # 4) Small delay, then greeting
-            await asyncio.sleep(0.15)
-            await openai_ws.send(json.dumps({
+            # 4) Trigger the greeting (same as your original)
+            loop.run_until_complete(openai_ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
                     "instructions": "Say exactly: Hello from Escallop."
                 }
-            }))
+            })))
             print("[stream] response.create sent (instructions only)")
 
-            # 5) Twilio -> OpenAI (server VAD will commit turns)
-            send_task = asyncio.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+            # 5) Twilio -> OpenAI sender (server VAD will commit)
+            send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
-            # 6) Run both
-            try:
-                await asyncio.gather(send_task, recv_task)
-            finally:
-                try:
-                    await openai_ws.close()
-                except Exception:
-                    pass
+            # 6) Run both until done
+            loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
 
         except Exception as e:
-            print("[stream.error] during async_runner:", repr(e))
+            print("[stream.thread] exception:", repr(e))
+        finally:
+            # Close OpenAI WS and the loop so next call starts fresh
+            try:
+                if openai_ws is not None:
+                    loop.run_until_complete(openai_ws.close())
+            except Exception:
+                pass
+            try:
+                loop.stop()
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception:
+                pass
 
-    # IMPORTANT: run the async pipeline directly (no extra thread)
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
     try:
-        asyncio.run(async_runner())
-    except Exception as e:
-        print("[stream.run] exception:", repr(e))
+        while t.is_alive():
+            time.sleep(0.05)
+    except Exception:
+        pass
 
 
 # --- Main (local only) ---
