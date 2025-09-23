@@ -331,6 +331,7 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
 
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
     # Per-call trace
@@ -353,7 +354,7 @@ def stream(ws):
             openai_ws = loop.run_until_complete(openai_realtime_connect())
             log("openai.ws.connected", trace=trace, model=OPENAI_REALTIME_MODEL)
 
-            # *** Keep your original session.update exactly as-is ***
+            # Keep your original session/update exactly as before (audio path unchanged)
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -376,7 +377,7 @@ def stream(ws):
             loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
             log("openai.session.update.sent", trace=trace)
 
-            stream_info = {"sid": None, "trace": trace, "stats": {}}
+            stream_info = {"sid": None, "trace": trace}
 
             recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
             loop.run_until_complete(asyncio.sleep(0))  # yield
@@ -410,18 +411,8 @@ def stream(ws):
     except Exception as e:
         log("call.thread.wait.error", trace=trace, error=repr(e))
     finally:
-        # Summarize counters for this call
-        stats = {
-            k: (list(v) if isinstance(v, set) else v)
-            for k, v in (t := {}).items()
-        }
-        # If we captured stats in stream_info, prefer those
-        try:
-            # We can’t access stream_info here directly; rely on logs above for details.
-            pass
-        except Exception:
-            pass
         log("call.end", trace=trace)
+
 
 
 
