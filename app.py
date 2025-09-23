@@ -20,6 +20,9 @@ CALL_TRACE_ID = None  # set per call
 def new_trace_id() -> str:
     return uuid.uuid4().hex[:8]
 
+def _bool(v):  # helper for clean booleans
+    return bool(v and str(v).strip())
+
 BOOT_TS = time.monotonic()
 
 def log(tag, **fields):
@@ -60,8 +63,60 @@ sock = Sock(app)
 # --- Health check ---
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "ok": True,
+        "uptime_ms": int((time.monotonic() - BOOT_TS) * 1000),
+        "service": "escallop-voice-pm",
+        "ts": datetime.utcnow().isoformat() + "Z"
+    }
 
+@app.get("/ready")
+def ready():
+    checks = {
+        "OPENAI_API_KEY_present": _bool(OPENAI_API_KEY),
+        "OPENAI_REALTIME_MODEL_present": _bool(OPENAI_REALTIME_MODEL),
+        "PUBLIC_BASE_URL_present": _bool(PUBLIC_BASE_URL),
+    }
+    ok = all(checks.values())
+    return {
+        "ok": ok,
+        "checks": checks,
+        "ws_stream_url": (
+            ("wss://" + PUBLIC_BASE_URL[len("https://"):] + "/stream")
+            if PUBLIC_BASE_URL.startswith("https://") else
+            (("ws://" + PUBLIC_BASE_URL[len("http://"):] + "/stream")
+             if PUBLIC_BASE_URL.startswith("http://") else
+             "wss://escallop-voice-pm-aa62425200e7.herokuapp.com/stream")
+        ),
+        "voice_webhook": f"{(PUBLIC_BASE_URL or 'https://escallop-voice-pm-aa62425200e7.herokuapp.com').rstrip('/')}/voice_stream_test",
+        "ts": datetime.utcnow().isoformat() + "Z"
+    }, (200 if ok else 503)
+
+@app.get("/version")
+def version():
+    return {
+        "name": "escallop-voice-pm",
+        "model": OPENAI_REALTIME_MODEL,
+        "voice": OPENAI_VOICE,
+        "public_base_url": PUBLIC_BASE_URL or "(default heroku app URL)",
+        "python": os.getenv("PYTHON_VERSION", "3.x"),
+        "stack_note": "If you see runtime.txt deprecation, switch to .python-version on Heroku"
+    }
+
+@app.get("/whoami")
+def whoami():
+    base = (PUBLIC_BASE_URL or "https://escallop-voice-pm-aa62425200e7.herokuapp.com").rstrip("/")
+    return {
+        "public_base_url": base,
+        "twilio_stream_ws": (
+            "wss://" + base[len("https://"):] + "/stream" if base.startswith("https://")
+            else ("ws://" + base[len("http://"):] + "/stream" if base.startswith("http://")
+                  else "wss://escallop-voice-pm-aa62425200e7.herokuapp.com/stream")
+        ),
+        "health_url": base + "/health",
+        "ready_url": base + "/ready",
+        "voice_webhook_for_testing": base + "/voice_stream_test"
+    }
 
 # --- Safe default: Say-only webhook ---
 @app.post("/voice")
