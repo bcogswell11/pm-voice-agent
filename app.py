@@ -303,13 +303,13 @@ def stream(ws):
             pass
         return
 
-    def thread_target():
-        async def async_runner():
+    async def async_runner():
+        try:
             # 1) Connect to OpenAI Realtime WS
             openai_ws = await openai_realtime_connect()
             print("[stream] openai connected")
 
-            # 2) Apply session: PCMU in/out, audio-only (keep as-is)
+            # 2) Apply session (PCMU in/out, audio-only for now)
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -332,12 +332,12 @@ def stream(ws):
             await openai_ws.send(json.dumps(session_update))
             print("[stream] session.update sent (pcmu in/out, audio-only)")
 
-            # 3) Start OpenAI -> Twilio reader FIRST so we don't miss early audio deltas
+            # 3) Start OpenAI -> Twilio FIRST
             stream_info = {"sid": None}
             recv_task = asyncio.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-            await asyncio.sleep(0)  # yield to start the task
+            await asyncio.sleep(0)
 
-            # 4) Small delay to let session apply, then force a spoken greeting
+            # 4) Small delay, then greeting
             await asyncio.sleep(0.15)
             await openai_ws.send(json.dumps({
                 "type": "response.create",
@@ -347,10 +347,10 @@ def stream(ws):
             }))
             print("[stream] response.create sent (instructions only)")
 
-            # 5) Start Twilio -> OpenAI sender (server VAD will commit turns)
+            # 5) Twilio -> OpenAI (server VAD will commit turns)
             send_task = asyncio.create_task(twilio_to_openai(ws, openai_ws, stream_info))
 
-            # 6) Run both until done
+            # 6) Run both
             try:
                 await asyncio.gather(send_task, recv_task)
             finally:
@@ -359,19 +359,14 @@ def stream(ws):
                 except Exception:
                     pass
 
-        # Create/close a fresh event loop for this call (prevents nested-loop errors)
-        try:
-            asyncio.run(async_runner())
         except Exception as e:
-            print("[stream.thread] exception:", repr(e))
+            print("[stream.error] during async_runner:", repr(e))
 
-    t = threading.Thread(target=thread_target, daemon=True)
-    t.start()
+    # IMPORTANT: run the async pipeline directly (no extra thread)
     try:
-        while t.is_alive():
-            time.sleep(0.05)
-    except Exception:
-        pass
+        asyncio.run(async_runner())
+    except Exception as e:
+        print("[stream.run] exception:", repr(e))
 
 
 # --- Main (local only) ---
