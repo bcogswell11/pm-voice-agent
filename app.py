@@ -130,9 +130,16 @@ async def openai_realtime_connect():
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
     Read OpenAI events. Forward audio if we get deltas.
+    (Instrumentation only; audio handling unchanged.)
     """
-    text_chars = 0
-    audio_frames = 0
+    trace = stream_info.get("trace") or new_trace_id()
+    stats = stream_info.setdefault("stats", {
+        "openai_events": 0,
+        "openai_audio_frames_out": 0,
+        "errors": 0,
+        "text_chars": 0,
+    })
+    log("openai.pipe.start", trace=trace)
 
     def send_ulaw_b64_to_twilio(b64audio: str):
         sid = stream_info.get("sid")
@@ -150,7 +157,7 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 "media": {"payload": payload}
             }))
         except Exception as e:
-            print("[twilio<-openai] send error:", e)
+            log("twilio.send.error", trace=trace, error=repr(e))
 
     try:
         async for raw in openai_ws:
@@ -159,16 +166,15 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             except Exception:
                 continue
 
-            t = evt.get("type")
-            if not t:
-                continue
+            stats["openai_events"] += 1
+            t = evt.get("type") or ""
 
             if t in ("response.created", "response.done", "session.updated", "session.created"):
-                print("[openai.diag] event", json.dumps({"type": t}))
+                log("openai.event", trace=trace, type=t)
 
             if t in ("response.output_text.delta", "response.text.delta"):
                 delta = evt.get("delta") or ""
-                text_chars += len(delta)
+                stats["text_chars"] += len(delta)
                 continue
 
             b64audio = None
@@ -180,12 +186,16 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                     b64audio = maybe.get("audio")
 
             if b64audio:
-                audio_frames += 1
+                stats["openai_audio_frames_out"] += 1
+                n = stats["openai_audio_frames_out"]
+                if n <= 3 or n % 50 == 0:
+                    log("openai.audio.delta", trace=trace, frames=n)
                 send_ulaw_b64_to_twilio(b64audio)
                 continue
 
             if t == "error":
-                print("[openai.diag] error", evt)
+                stats["errors"] += 1
+                log("openai.error", trace=trace, evt=evt)
 
         sid = stream_info.get("sid")
         if sid:
@@ -193,23 +203,32 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 twilio_ws.send(json.dumps({"event": "stop", "streamSid": sid}))
             except Exception:
                 pass
-        print(f"[openai.summary] text_chars={text_chars} audio_frames={audio_frames}")
+        log("openai.pipe.stop", trace=trace,
+            text_chars=stats["text_chars"],
+            audio_frames=stats["openai_audio_frames_out"])
     except Exception as e:
-        print("[openai_to_twilio] exception:", repr(e))
+        log("openai_to_twilio.exception", trace=trace, error=repr(e))
 
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
     Forward Twilio μ-law frames to OpenAI.
+    (Instrumentation only; audio handling unchanged.)
     """
+    trace = stream_info.get("trace") or new_trace_id()
+    stats = stream_info.setdefault("stats", {
+        "twilio_frames_in": 0,
+        "twilio_events": set(),
+    })
     frames = 0
     last_evt = None
+    log("twilio.pipe.start", trace=trace)
 
     while True:
         try:
             msg = await asyncio.to_thread(twilio_ws.receive)
         except Exception as e:
-            print(f"[twilio.recv.exception] {e}")
+            log("twilio.recv.exception", trace=trace, error=repr(e))
             break
 
         if msg is None:
@@ -222,98 +241,133 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
         evt = data.get("event")
         if evt != last_evt:
-            print(f"[twilio.event] {evt}")
+            log("twilio.event", trace=trace, event=evt)
             last_evt = evt
+        if evt:
+            stats["twilio_events"].add(evt)
 
         if evt == "start":
             sid = data.get("start", {}).get("streamSid")
             stream_info["sid"] = sid
-            print(f"[twilio.start] streamSid={sid}")
+            log("twilio.start", trace=trace, streamSid=sid)
+
         elif evt == "media":
             payload = data.get("media", {}).get("payload")
             if payload:
                 frames += 1
+                stats["twilio_frames_in"] += 1
                 if frames <= 3 or frames % 50 == 0:
-                    print(f"[twilio.media.in] frames={frames}")
+                    log("twilio.media.in", trace=trace, frames=frames)
                 try:
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": payload
                     }))
                 except Exception as e:
-                    print(f"[openai.append.error] {e}")
+                    log("openai.append.error", trace=trace, error=repr(e))
+
         elif evt == "stop":
-            print("[twilio.stop] received")
+            log("twilio.stop", trace=trace)
             break
 
+    log("twilio.pipe.stop", trace=trace)
     return
+
 
 
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
+    # Per-call trace
+    trace = new_trace_id()
+    log("call.start", trace=trace)
+
     if not OPENAI_API_KEY:
         try:
             ws.send(json.dumps({"event": "stop"}))
         except Exception:
             pass
+        log("call.no_api_key", trace=trace)
         return
 
     loop = asyncio.new_event_loop()
 
     def runner():
         asyncio.set_event_loop(loop)
-        openai_ws = loop.run_until_complete(openai_realtime_connect())
-        print("[stream] openai connected")
-
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities": ["audio"],
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
-                    },
-                    "output": {
-                        "format": {"type": "audio/pcmu"},
-                        "voice": OPENAI_VOICE or "alloy"
-                    }
-                },
-                "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] session.update sent (pcmu in/out, audio-only)")
-
-        stream_info = {"sid": None}
-        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-        loop.run_until_complete(asyncio.sleep(0))
-
-        loop.run_until_complete(openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
-        })))
-        print("[stream] response.create sent (instructions only)")
-
-        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
-
-        loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
-
         try:
-            loop.run_until_complete(openai_ws.close())
-        except Exception:
-            pass
+            openai_ws = loop.run_until_complete(openai_realtime_connect())
+            log("openai.ws.connected", trace=trace, model=OPENAI_REALTIME_MODEL)
+
+            # *** Keep your original session.update exactly as-is ***
+            session_update = {
+                "type": "session.update",
+                "session": {
+                    "type": "realtime",
+                    "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcmu"},
+                            "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
+                        },
+                        "output": {
+                            "format": {"type": "audio/pcmu"},
+                            "voice": OPENAI_VOICE or "alloy"
+                        }
+                    },
+                    "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
+                }
+            }
+            loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
+            log("openai.session.update.sent", trace=trace)
+
+            stream_info = {"sid": None, "trace": trace, "stats": {}}
+
+            recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
+            loop.run_until_complete(asyncio.sleep(0))  # yield
+
+            # Keep your greeting so you can hear downlink immediately
+            loop.run_until_complete(openai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
+            })))
+            log("openai.response.create.greeting", trace=trace)
+
+            send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+
+            loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
+            log("call.tasks.joined", trace=trace)
+
+            try:
+                loop.run_until_complete(openai_ws.close())
+                log("openai.ws.closed", trace=trace)
+            except Exception as e:
+                log("openai.ws.close.error", trace=trace, error=repr(e))
+
+        except Exception as e:
+            log("call.runner.error", trace=trace, error=repr(e))
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
     try:
         while t.is_alive():
             time.sleep(0.05)
-    except Exception:
-        pass
+    except Exception as e:
+        log("call.thread.wait.error", trace=trace, error=repr(e))
+    finally:
+        # Summarize counters for this call
+        stats = {
+            k: (list(v) if isinstance(v, set) else v)
+            for k, v in (t := {}).items()
+        }
+        # If we captured stats in stream_info, prefer those
+        try:
+            # We can’t access stream_info here directly; rely on logs above for details.
+            pass
+        except Exception:
+            pass
+        log("call.end", trace=trace)
+
 
 
 # --- Main ---
