@@ -184,21 +184,20 @@ async def openai_realtime_connect():
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    Read OpenAI events. Forward audio if we get deltas.
-    (Instrumentation only; audio handling unchanged.)
+    Read OpenAI events and forward audio (unchanged behavior).
+    Adds instrumentation so we can see if audio was produced and sent.
     """
     trace = stream_info.get("trace") or new_trace_id()
-    stats = stream_info.setdefault("stats", {
-        "openai_events": 0,
-        "openai_audio_frames_out": 0,
-        "errors": 0,
-        "text_chars": 0,
-    })
-    log("openai.pipe.start", trace=trace)
+    text_chars = 0
+    audio_frames = 0
+    errors = 0
 
     def send_ulaw_b64_to_twilio(b64audio: str):
         sid = stream_info.get("sid")
         if not sid:
+            # We can't send audio until Twilio sends 'start' with streamSid.
+            if audio_frames <= 3:
+                print(f"[{trace}] WARN: got OpenAI audio before Twilio 'start' (no streamSid yet)")
             return
         try:
             raw = base64.b64decode(b64audio)
@@ -212,8 +211,9 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 "media": {"payload": payload}
             }))
         except Exception as e:
-            log("twilio.send.error", trace=trace, error=repr(e))
+            print(f"[{trace}] ERROR twilio send: {e!r}")
 
+    print(f"[{trace}] openai.pipe.start")
     try:
         async for raw in openai_ws:
             try:
@@ -221,15 +221,14 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             except Exception:
                 continue
 
-            stats["openai_events"] += 1
             t = evt.get("type") or ""
 
             if t in ("response.created", "response.done", "session.updated", "session.created"):
-                log("openai.event", trace=trace, type=t)
+                print(f"[{trace}] openai.event {t}")
 
             if t in ("response.output_text.delta", "response.text.delta"):
                 delta = evt.get("delta") or ""
-                stats["text_chars"] += len(delta)
+                text_chars += len(delta)
                 continue
 
             b64audio = None
@@ -241,16 +240,15 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                     b64audio = maybe.get("audio")
 
             if b64audio:
-                stats["openai_audio_frames_out"] += 1
-                n = stats["openai_audio_frames_out"]
-                if n <= 3 or n % 50 == 0:
-                    log("openai.audio.delta", trace=trace, frames=n)
+                audio_frames += 1
+                if audio_frames <= 3 or audio_frames % 50 == 0:
+                    print(f"[{trace}] openai.audio.delta frames={audio_frames}")
                 send_ulaw_b64_to_twilio(b64audio)
                 continue
 
             if t == "error":
-                stats["errors"] += 1
-                log("openai.error", trace=trace, evt=evt)
+                errors += 1
+                print(f"[{trace}] openai.error {evt}")
 
         sid = stream_info.get("sid")
         if sid:
@@ -258,32 +256,28 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
                 twilio_ws.send(json.dumps({"event": "stop", "streamSid": sid}))
             except Exception:
                 pass
-        log("openai.pipe.stop", trace=trace,
-            text_chars=stats["text_chars"],
-            audio_frames=stats["openai_audio_frames_out"])
+        print(f"[{trace}] openai.pipe.stop text_chars={text_chars} audio_frames={audio_frames} errors={errors}")
     except Exception as e:
-        log("openai_to_twilio.exception", trace=trace, error=repr(e))
+        print(f"[{trace}] openai_to_twilio.exception {e!r}")
 
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Forward Twilio μ-law frames to OpenAI.
-    (Instrumentation only; audio handling unchanged.)
+    Forward Twilio μ-law frames to OpenAI (unchanged behavior).
+    Adds instrumentation to prove whether Twilio sent 'start'/'media'.
     """
     trace = stream_info.get("trace") or new_trace_id()
-    stats = stream_info.setdefault("stats", {
-        "twilio_frames_in": 0,
-        "twilio_events": set(),
-    })
     frames = 0
     last_evt = None
-    log("twilio.pipe.start", trace=trace)
+    got_start = False
+
+    print(f"[{trace}] twilio.pipe.start")
 
     while True:
         try:
             msg = await asyncio.to_thread(twilio_ws.receive)
         except Exception as e:
-            log("twilio.recv.exception", trace=trace, error=repr(e))
+            print(f"[{trace}] twilio.recv.exception {e!r}")
             break
 
         if msg is None:
@@ -296,37 +290,36 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
         evt = data.get("event")
         if evt != last_evt:
-            log("twilio.event", trace=trace, event=evt)
+            print(f"[{trace}] twilio.event {evt}")
             last_evt = evt
-        if evt:
-            stats["twilio_events"].add(evt)
 
         if evt == "start":
+            got_start = True
             sid = data.get("start", {}).get("streamSid")
             stream_info["sid"] = sid
-            log("twilio.start", trace=trace, streamSid=sid)
+            print(f"[{trace}] twilio.start streamSid={sid}")
 
         elif evt == "media":
             payload = data.get("media", {}).get("payload")
             if payload:
                 frames += 1
-                stats["twilio_frames_in"] += 1
                 if frames <= 3 or frames % 50 == 0:
-                    log("twilio.media.in", trace=trace, frames=frames)
+                    print(f"[{trace}] twilio.media.in frames={frames}")
                 try:
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": payload
                     }))
                 except Exception as e:
-                    log("openai.append.error", trace=trace, error=repr(e))
+                    print(f"[{trace}] openai.append.error {e!r}")
 
         elif evt == "stop":
-            log("twilio.stop", trace=trace)
+            print(f"[{trace}] twilio.stop")
             break
 
-    log("twilio.pipe.stop", trace=trace)
+    print(f"[{trace}] twilio.pipe.stop got_start={got_start} total_frames={frames}")
     return
+
 
 
 
