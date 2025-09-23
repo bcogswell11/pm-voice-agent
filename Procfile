@@ -1,2 +1,3 @@
-web: gunicorn app:app --worker-class eventlet -w 1 --timeout=120
+web: gunicorn app:app -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --timeout 120
+
 
