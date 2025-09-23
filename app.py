@@ -250,70 +250,69 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
 
 # --- WebSocket: Twilio connects here ---
+# --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
+    trace_id = new_trace_id()
+    print(f"[CALL {trace_id}] ---- Call started ----")
+
     if not OPENAI_API_KEY:
         try:
             ws.send(json.dumps({"event": "stop"}))
         except Exception:
             pass
+        print(f"[CALL {trace_id}] No API key, ending immediately.")
         return
 
     loop = asyncio.new_event_loop()
 
     def runner():
         asyncio.set_event_loop(loop)
-        openai_ws = loop.run_until_complete(openai_realtime_connect())
-        print("[stream] openai connected")
-
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                "output_modalities": ["audio"],
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcmu"},
-                        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
-                    },
-                    "output": {
-                        "format": {"type": "audio/pcmu"},
-                        "voice": OPENAI_VOICE or "alloy"
-                    }
-                },
-                "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
-            }
-        }
-        loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-        print("[stream] session.update sent (pcmu in/out, audio-only)")
-
-        stream_info = {"sid": None}
-        recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-        loop.run_until_complete(asyncio.sleep(0))
-
-        loop.run_until_complete(openai_ws.send(json.dumps({
-            "type": "response.create",
-            "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
-        })))
-        print("[stream] response.create sent (instructions only)")
-
-        send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
-
-        loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
-
         try:
+            openai_ws = loop.run_until_complete(openai_realtime_connect())
+            print(f"[CALL {trace_id}] Connected to OpenAI realtime API.")
+
+            session_update = {
+                "type": "session.update",
+                "session": {
+                    "type": "realtime",
+                    "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "input": {"format": {"type": "audio/pcmu"}},
+                        "output": {"format": {"type": "audio/pcmu"},
+                                   "voice": OPENAI_VOICE or "alloy"}
+                    },
+                    "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
+                }
+            }
+            loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
+            print(f"[CALL {trace_id}] Sent session.update to OpenAI.")
+
+            stream_info = {"sid": None}
+
+            recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
+            send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+
+            loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
+            print(f"[CALL {trace_id}] Twilio ↔ OpenAI tasks finished.")
+
             loop.run_until_complete(openai_ws.close())
-        except Exception:
-            pass
+            print(f"[CALL {trace_id}] Closed OpenAI websocket.")
+        except Exception as e:
+            print(f"[CALL {trace_id}] ERROR in runner: {e!r}")
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
+
     try:
         while t.is_alive():
             time.sleep(0.05)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[CALL {trace_id}] ERROR waiting for thread: {e!r}")
+    finally:
+        print(f"[CALL {trace_id}] ---- Call ended ----")
+
 
 
 # --- Main ---
