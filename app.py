@@ -320,14 +320,74 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     print(f"[{trace}] twilio.pipe.stop got_start={got_start} total_frames={frames}")
     return
 
+async def _handle_call_async(ws, trace):
+    # 1) Connect to OpenAI
+    try:
+        openai_ws = await openai_realtime_connect()
+        log("openai.ws.connected", trace=trace, model=OPENAI_REALTIME_MODEL)
+    except Exception as e:
+        log("openai.ws.connect.error", trace=trace, error=repr(e))
+        return
+
+    try:
+        # 2) Send session.update (unchanged audio config)
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": OPENAI_VOICE or "alloy"
+                    }
+                },
+                "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
+            }
+        }
+        await openai_ws.send(json.dumps(session_update))
+        log("openai.session.update.sent", trace=trace)
+
+        # 3) Kick off greeting (unchanged)
+        await openai_ws.send(json.dumps({
+            "type": "response.create",
+            "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
+        }))
+        log("openai.response.create.greeting", trace=trace)
+
+        # 4) Bridge tasks
+        stream_info = {"sid": None, "trace": trace}
+        recv_task = asyncio.create_task(openai_to_twilio(ws, openai_ws, stream_info))
+        send_task = asyncio.create_task(twilio_to_openai(ws, openai_ws, stream_info))
+
+        # 5) Wait for either to finish, then cleanly cancel the other
+        done, pending = await asyncio.wait(
+            {recv_task, send_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        log("call.tasks.joined", trace=trace)
+    finally:
+        try:
+            await openai_ws.close()
+            log("openai.ws.closed", trace=trace)
+        except Exception as e:
+            log("openai.ws.close.error", trace=trace, error=repr(e))
 
 
 
+# --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
 @sock.route("/stream")
 def stream(ws):
-    # Per-call trace
     trace = new_trace_id()
     log("call.start", trace=trace)
 
@@ -339,64 +399,16 @@ def stream(ws):
         log("call.no_api_key", trace=trace)
         return
 
-    loop = asyncio.new_event_loop()
-
+    # Run the whole call in a fresh event loop **per call**.
+    # Using a thread avoids any "loop already running" conflicts.
     def runner():
-        asyncio.set_event_loop(loop)
         try:
-            openai_ws = loop.run_until_complete(openai_realtime_connect())
-            log("openai.ws.connected", trace=trace, model=OPENAI_REALTIME_MODEL)
-
-            # Keep your original session/update exactly as before (audio path unchanged)
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "type": "realtime",
-                    "model": OPENAI_REALTIME_MODEL or "gpt-realtime",
-                    "output_modalities": ["audio"],
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcmu"},
-                            "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
-                        },
-                        "output": {
-                            "format": {"type": "audio/pcmu"},
-                            "voice": OPENAI_VOICE or "alloy"
-                        }
-                    },
-                    "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
-                }
-            }
-            loop.run_until_complete(openai_ws.send(json.dumps(session_update)))
-            log("openai.session.update.sent", trace=trace)
-
-            stream_info = {"sid": None, "trace": trace}
-
-            recv_task = loop.create_task(openai_to_twilio(ws, openai_ws, stream_info))
-            loop.run_until_complete(asyncio.sleep(0))  # yield
-
-            # Keep your greeting so you can hear downlink immediately
-            loop.run_until_complete(openai_ws.send(json.dumps({
-                "type": "response.create",
-                "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
-            })))
-            log("openai.response.create.greeting", trace=trace)
-
-            send_task = loop.create_task(twilio_to_openai(ws, openai_ws, stream_info))
-
-            loop.run_until_complete(asyncio.gather(send_task, recv_task, return_exceptions=True))
-            log("call.tasks.joined", trace=trace)
-
-            try:
-                loop.run_until_complete(openai_ws.close())
-                log("openai.ws.closed", trace=trace)
-            except Exception as e:
-                log("openai.ws.close.error", trace=trace, error=repr(e))
-
+            asyncio.run(_handle_call_async(ws, trace))
         except Exception as e:
+            # If asyncio.run raises, we’ll see it here
             log("call.runner.error", trace=trace, error=repr(e))
 
-    t = threading.Thread(target=runner, daemon=True)
+    t = threading.Thread(target=runner, daemon=True, name=f"call-{trace}")
     t.start()
     try:
         while t.is_alive():
@@ -405,6 +417,7 @@ def stream(ws):
         log("call.thread.wait.error", trace=trace, error=repr(e))
     finally:
         log("call.end", trace=trace)
+
 
 
 
