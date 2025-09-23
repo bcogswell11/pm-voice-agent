@@ -217,6 +217,7 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
         if evt == "start":
             sid = data.get("start", {}).get("streamSid")
             stream_info["sid"] = sid
+            stream_info["open"] = True
             print(f"[twilio.start] streamSid={sid} tracks={data.get('start',{}).get('tracks')}")
 
             # --- INLINE BURST: send 10 silent frames immediately (no delay) ---
@@ -243,6 +244,7 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
                     print(f"[openai.append.error] {e}")
 
         elif evt == "stop":
+            stream_info["open"] = False
             print("[twilio.stop] received")
             break
 
@@ -251,11 +253,35 @@ async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
-    TEMP DIAGNOSTIC: do NOT send anything to Twilio.
-    Just read OpenAI events and log them so we can prove the stream stability.
+    Read OpenAI events and forward μ-law audio frames to Twilio.
+    - Buffers until Twilio sends us a streamSid ('start' event).
+    - Uses asyncio.to_thread() for twilio_ws.send() (it's blocking).
+    - Light pacing so playback is smooth.
     """
-    text_chars = 0
+    import json, base64, asyncio
+
+    pending_ulaw = []   # base64 μ-law chunks waiting to send
     audio_frames = 0
+    text_chars = 0
+    stream_open = False
+
+    async def safe_send(obj):
+        def _send():
+            twilio_ws.send(json.dumps(obj))
+        try:
+            await asyncio.to_thread(_send)
+        except Exception as e:
+            print("[twilio<-openai] send error:", e)
+
+    async def flush():
+        sid = stream_info.get("sid")
+        if not sid:
+            return
+        while pending_ulaw:
+            b64audio = pending_ulaw.pop(0)
+            await safe_send({"event": "media", "streamSid": sid, "media": {"payload": b64audio}})
+            await asyncio.sleep(0.02)  # ~20ms pacing
+
     try:
         async for raw in openai_ws:
             try:
@@ -263,27 +289,49 @@ async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
             except Exception:
                 continue
 
-            t = evt.get("type")
+            t = evt.get("type") or ""
+
+            # helpful diags
             if t in ("session.created", "session.updated", "response.created", "response.done"):
                 print("[openai.diag]", json.dumps({"type": t}))
 
+            # text deltas (optional to log)
             if t in ("response.output_text.delta", "response.text.delta"):
                 delta = evt.get("delta") or ""
                 text_chars += len(delta)
                 if text_chars <= 200:
                     print(f"[openai.text] +{len(delta)} chars (total={text_chars})")
+                continue
 
+            # audio deltas (GA names vary)
+            b64audio = None
             if t in ("response.audio.delta", "response.output_audio.delta"):
+                b64audio = evt.get("delta")
+            elif t in ("response.output_item.delta", "response.delta"):
+                maybe = evt.get("delta")
+                if isinstance(maybe, dict):
+                    b64audio = maybe.get("audio")
+
+            if b64audio:
                 audio_frames += 1
-                if audio_frames <= 3 or audio_frames % 50 == 0:
-                    print(f"[openai.audio.delta] #{audio_frames}")
+                pending_ulaw.append(b64audio)
+                if stream_open:
+                    await flush()
+                continue
 
             if t == "error":
                 print("[openai.error]", evt)
 
+        # stream ended from OpenAI side
+        await flush()
+        sid = stream_info.get("sid")
+        if sid:
+            await safe_send({"event": "stop", "streamSid": sid})
         print(f"[openai.summary] text_chars={text_chars} audio_frames={audio_frames}")
+
     except Exception as e:
-        print("[openai_to_twilio.diag] exception:", repr(e))
+        print("[openai_to_twilio] exception:", repr(e))
+
 
 
 # --- WebSocket: Twilio connects here ---
@@ -332,13 +380,13 @@ def stream(ws):
 
             # 4) Small delay, then greeting
             await asyncio.sleep(0.15)
-            # await openai_ws.send(json.dumps({
-            #    "type": "response.create",
-            #    "response": {
-            #        "instructions": "Say exactly: Hello from Escallop."
-            #    }
-            # }))
-            # print("[stream] response.create sent (instructions only)")
+            await openai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {
+                    "instructions": "Say exactly: Hello from Escallop."
+                }
+            }))
+            print("[stream] response.create sent (instructions only)")
 
             # 5) Twilio -> OpenAI (server VAD will commit turns)
             send_task = asyncio.create_task(twilio_to_openai(ws, openai_ws, stream_info))
