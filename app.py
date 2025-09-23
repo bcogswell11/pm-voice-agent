@@ -134,10 +134,11 @@ def voice_stream_test():
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{stream_url}" track="both" statusCallback="{status_url}" statusCallbackMethod="POST"/>
+    <Stream url="{stream_url}" statusCallback="{status_url}" statusCallbackMethod="POST"/>
   </Connect>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
+
 
 
 
