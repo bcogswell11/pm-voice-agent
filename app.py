@@ -294,7 +294,7 @@ def stream(ws):
 
         loop.run_until_complete(openai_ws.send(json.dumps({
             "type": "response.create",
-            "response": {"instructions": "Say exactly: Hello from Escallop."}
+            "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
         })))
         print("[stream] response.create sent (instructions only)")
 
