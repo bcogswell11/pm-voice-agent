@@ -12,6 +12,18 @@ import audioop
 import time
 from datetime import datetime
 import uuid
+from flask import request
+
+@app.post("/stream_status")
+def stream_status():
+    # Twilio sends: AccountSid, CallSid, StreamSid, StreamEvent, StreamError (if any), StreamName
+    fields = {}
+    try:
+        fields = request.form.to_dict(flat=True)
+    except Exception:
+        pass
+    print("[twilio.stream_status]", json.dumps(fields, ensure_ascii=False))
+    return ("", 200)
 
 DEBUG_HEARTBEAT_MS = int(os.getenv("DEBUG_HEARTBEAT_MS", "1000"))  # 1s
 DEBUG_LOG_SAMPLES  = int(os.getenv("DEBUG_LOG_SAMPLES",  "0"))     # 0=off, >0 logs first N PCM16 samples
@@ -108,19 +120,26 @@ def voice_pcmout_test():
 def voice_stream_test():
     # Build secure wss:// URL to our /stream endpoint
     if PUBLIC_BASE_URL.startswith("https://"):
+        base = PUBLIC_BASE_URL
         stream_url = "wss://" + PUBLIC_BASE_URL[len("https://"):] + "/stream"
     elif PUBLIC_BASE_URL.startswith("http://"):
+        base = PUBLIC_BASE_URL
         stream_url = "ws://" + PUBLIC_BASE_URL[len("http://"):] + "/stream"
     else:
+        # fallback to your Heroku base
+        base = "https://escallop-voice-pm-aa62425200e7.herokuapp.com"
         stream_url = "wss://escallop-voice-pm-aa62425200e7.herokuapp.com/stream"
+
+    status_url = base.rstrip("/") + "/stream_status"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{stream_url}"/>
+    <Stream url="{stream_url}" statusCallback="{status_url}" statusCallbackMethod="POST"/>
   </Connect>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
+
 
 # ------------- Twilio <-> OpenAI relay helpers -------------
 
