@@ -152,58 +152,93 @@ def _safe_get(d, *keys, default=None):
 
 async def twilio_to_openai(twilio_ws, openai_ws, stream_info):
     """
-    Forward Twilio μ-law (audio/pcmu @ 8kHz) frames directly to OpenAI:
-      - append base64 payload as 'audio' (string)
-      - DO NOT call input_audio_buffer.commit; server_vad will commit
+    Forward Twilio μ-law (audio/pcmu @ 8kHz) frames to OpenAI.
+    ALSO: send a Twilio 'mark' keepalive right after 'start' and every second
+    until we see media, to prevent early hangup on some edges.
     """
     frames = 0
     last_evt = None
+    saw_media = False
+    keepalive_running = True
 
-    while True:
+    async def safe_send(obj):
+        import json
+        def _send():
+            twilio_ws.send(json.dumps(obj))
         try:
-            msg = await asyncio.to_thread(twilio_ws.receive)
+            await asyncio.to_thread(_send)
         except Exception as e:
-            print(f"[twilio.recv.exception] {e}")
-            break
+            print(f"[twilio.keepalive.send.error] {e}")
 
-        if msg is None:
-            print("[twilio] ws.receive() returned None")
-            break
+    async def keepalive_task():
+        # Send a "mark" every 1s until we see media (or stream stops)
+        while keepalive_running:
+            sid = stream_info.get("sid")
+            if sid and not saw_media:
+                await safe_send({"event": "mark", "streamSid": sid, "mark": {"name": "ready"}})
+                # small log so we know it's ticking
+                print("[twilio.keepalive] mark sent")
+            await asyncio.sleep(1.0)
 
+    # start keepalive in the background
+    ka = asyncio.create_task(keepalive_task())
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.to_thread(twilio_ws.receive)
+            except Exception as e:
+                print(f"[twilio.recv.exception] {e}")
+                break
+
+            if msg is None:
+                print("[twilio] ws.receive() returned None")
+                break
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            evt = data.get("event")
+            if evt != last_evt:
+                print(f"[twilio.event] {evt}")
+                last_evt = evt
+
+            if evt == "start":
+                sid = data.get("start", {}).get("streamSid")
+                stream_info["sid"] = sid
+                print(f"[twilio.start] streamSid={sid} tracks={data.get('start',{}).get('tracks')}")
+                # Send an immediate keepalive mark to hold the stream open
+                await safe_send({"event": "mark", "streamSid": sid, "mark": {"name": "start-received"}})
+
+            elif evt == "media":
+                saw_media = True
+                payload = data.get("media", {}).get("payload")
+                if payload:
+                    frames += 1
+                    if frames <= 3 or frames % 50 == 0:
+                        print(f"[twilio.media.in] frames={frames}")
+                    try:
+                        await openai_ws.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": payload  # base64 μ-law bytes
+                        }))
+                    except Exception as e:
+                        print(f"[openai.append.error] {e}")
+
+            elif evt == "stop":
+                print("[twilio.stop] received")
+                break
+            # ignore other events
+
+    finally:
+        # stop keepalive
+        keepalive_running = False
         try:
-            data = json.loads(msg)
+            ka.cancel()
         except Exception:
-            continue
-
-        evt = data.get("event")
-        if evt != last_evt:
-            print(f"[twilio.event] {evt}")
-            last_evt = evt
-
-        if evt == "start":
-            sid = data.get("start", {}).get("streamSid")
-            stream_info["sid"] = sid
-            print(f"[twilio.start] streamSid={sid} tracks={data.get('start',{}).get('tracks')}")
-        elif evt == "media":
-            payload = data.get("media", {}).get("payload")
-            if payload:
-                frames += 1
-                # Optional: log a little to know frames are flowing
-                if frames <= 3 or frames % 50 == 0:
-                    print(f"[twilio.media.in] frames={frames}")
-                try:
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": payload  # base64 μ-law bytes
-                    }))
-                except Exception as e:
-                    print(f"[openai.append.error] {e}")
-        elif evt == "stop":
-            print("[twilio.stop] received")
-            break
-        # ignore other events
-
-    return
+            pass
 
 async def openai_to_twilio(twilio_ws, openai_ws, stream_info):
     """
