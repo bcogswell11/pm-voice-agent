@@ -14,17 +14,6 @@ from datetime import datetime
 import uuid
 from flask import request
 
-@app.post("/stream_status")
-def stream_status():
-    # Twilio sends: AccountSid, CallSid, StreamSid, StreamEvent, StreamError (if any), StreamName
-    fields = {}
-    try:
-        fields = request.form.to_dict(flat=True)
-    except Exception:
-        pass
-    print("[twilio.stream_status]", json.dumps(fields, ensure_ascii=False))
-    return ("", 200)
-
 DEBUG_HEARTBEAT_MS = int(os.getenv("DEBUG_HEARTBEAT_MS", "1000"))  # 1s
 DEBUG_LOG_SAMPLES  = int(os.getenv("DEBUG_LOG_SAMPLES",  "0"))     # 0=off, >0 logs first N PCM16 samples
 
@@ -86,6 +75,17 @@ sock = Sock(app)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.post("/stream_status")
+def stream_status():
+    # Twilio sends: AccountSid, CallSid, StreamSid, StreamEvent, StreamError (if any), StreamName
+    fields = {}
+    try:
+        fields = request.form.to_dict(flat=True)
+    except Exception:
+        pass
+    print("[twilio.stream_status]", json.dumps(fields, ensure_ascii=False))
+    return ("", 200)
 
 # --- Safe default: Say-only webhook (keeps production stable) ---
 @app.post("/voice")
