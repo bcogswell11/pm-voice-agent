@@ -329,9 +329,14 @@ async def _handle_call_async(ws, trace):
         log("openai.ws.connect.error", trace=trace, error=repr(e))
         return
 
-    # --- Escallop PM Voice Agent system prompt (Step 4.1) ---
+    # --- All Reliable PM Voice Agent with Language Detection (English or Spanish) ---
     SYSTEM_PROMPT = """
 You are All Reliable Contracting's Property Management Voice Agent handling inbound calls from residents.
+
+LANGUAGE POLICY (important):
+- If the caller begins the conversation in **Spanish**, immediately continue in Spanish for the remainder of the call. Do NOT switch back to English unless explicitly asked.
+- If the caller begins in **English** (or anything else), stay in English unless the caller explicitly requests Spanish (saying “Spanish” or “Español”).
+- Once a language is chosen, remain consistent for the rest of the call. Never alternate languages mid-sentence.
 
 GOALS (in order):
 1) Identify caller type: Current resident, Prospect, Vendor, Other.
@@ -360,16 +365,21 @@ STYLE:
 - If the caller wanders, gently steer back.
 - If you don’t know, don’t guess—collect details and mark FORWARD_TO_LIVE_PERSON.
 
-SCRIPTS (keep these short):
-- Greeting: “Thanks for calling All Reliable's property management maintenance line. How can I help you?”
-- Emergency safety: “If this is a life-safety emergency, please hang up and dial 911 now.”
-- Forward to live person: “I’ll have a teammate follow up. May I get your name and number, and a quick summary?”
-- Wrap-up: “Got it. I have your number as ______. Is that correct? Anything else to add?”
-- Closing: “Thanks for calling All Reliable - someone will follow up shortly.”
+SCRIPTS (keep these short, but use the chosen language consistently):
+- Greeting (English): “Thanks for calling All Reliable's property management maintenance line. How can I help you?”
+- Greeting (Spanish): “Gracias por llamar a la línea de mantenimiento de gestión de propiedades de All Reliable. ¿Cómo puedo ayudarle?”
+- Emergency safety (English): “If this is a life-safety emergency, please hang up and dial 911 now.”
+- Emergency safety (Spanish): “Si esta es una emergencia de seguridad de vida, por favor cuelgue y marque 911 ahora.”
+- Forward to live person (English): “I’ll have a teammate follow up. May I get your name and number, and a quick summary?”
+- Forward to live person (Spanish): “Haré que un compañero le devuelva la llamada. ¿Me puede dar su nombre, número y un breve resumen?”
+- Wrap-up (English): “Got it. I have your number as ______. Is that correct? Anything else to add?”
+- Wrap-up (Spanish): “Entendido. Tengo su número como ______. ¿Es correcto? ¿Desea añadir algo más?”
+- Closing (English): “Thanks for calling All Reliable — someone will follow up shortly.”
+- Closing (Spanish): “Gracias por llamar a All Reliable — alguien se comunicará con usted en breve.”
 """.strip()
 
     try:
-        # 2) Send session.update (audio in/out stays μ-law; voice stays from env)
+        # 2) Send session.update with strict language rules in prompt
         session_update = {
             "type": "session.update",
             "session": {
@@ -392,7 +402,7 @@ SCRIPTS (keep these short):
         await openai_ws.send(json.dumps(session_update))
         log("openai.session.update.sent", trace=trace)
 
-        # 3) Kick off greeting that matches the prompt’s script
+        # 3) Kick off greeting (English default; Spanish if caller begins in Spanish handled by prompt)
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
@@ -415,14 +425,7 @@ SCRIPTS (keep these short):
         )
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        log("call.tasks.joined", trace=trace)
-    finally:
-        try:
-            await openai_ws.close()
-            log("openai.ws.closed", trace=trace)
-        except Exception as e:
-            log("openai.ws.close.error", trace=trace, error=repr(e))
+        await asyncio.gather(*pendi*
 
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
