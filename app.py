@@ -425,7 +425,15 @@ SCRIPTS (keep these short, but use the chosen language consistently):
         )
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pendi*
+        await asyncio.gather(*pending, return_exceptions=True)
+        log("call.tasks.joined", trace=trace)
+    finally:
+        try:
+            await openai_ws.close()
+            log("openai.ws.closed", trace=trace)
+        except Exception as e:
+            log("openai.ws.close.error", trace=trace, error=repr(e))
+
 
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
