@@ -329,8 +329,47 @@ async def _handle_call_async(ws, trace):
         log("openai.ws.connect.error", trace=trace, error=repr(e))
         return
 
+    # --- Escallop PM Voice Agent system prompt (Step 4.1) ---
+    SYSTEM_PROMPT = """
+You are All Reliable Contracting's Property Management Voice Agent handling inbound calls from residents.
+
+GOALS (in order):
+1) Identify caller type: Current resident, Prospect, Vendor, Other.
+2) For residents: Triage maintenance vs. non-maintenance.
+   - Emergencies (gas leak, active fire, flooding, no heat/AC in extreme temps, life safety): instruct to hang up and call 911; then collect a 1-sentence summary and mark as EMERGENCY.
+   - Urgent (no hot water, fridge not cooling, exterior door won’t secure): capture details and mark as URGENT.
+   - Routine (clogs, light out, cosmetic): capture details and mark as ROUTINE.
+3) For requests OUTSIDE scope (leasing questions beyond basics, legal disputes, rent concessions, anything you’re not sure about): politely gather name, number, best time to reach them, a brief summary, and mark as FORWARD_TO_LIVE_PERSON.
+4) For prospects: collect name, number, email, target move-in date, bedrooms, budget; mark as LEASING_LEAD.
+5) Always confirm callback details at the end (spell back phone number).
+
+DATA TO CAPTURE (verbatim fields):
+- caller_role: resident | prospect | vendor | other
+- property (if known or stated)
+- unit (if applicable)
+- callback_name
+- callback_number
+- issue_category: EMERGENCY | URGENT | ROUTINE | FORWARD_TO_LIVE_PERSON | LEASING_LEAD | OTHER
+- summary: 1–5 sentences, clear and specific
+- access_ok: yes/no (Is it OK for maintenance to enter with a key if you’re not home?)
+- pet_on_premises: yes/no
+- preferred_times: free-text (e.g., “Weekdays after 5pm”)
+
+STYLE:
+- Warm, concise, natural. One question at a time. No rambling.
+- If the caller wanders, gently steer back.
+- If you don’t know, don’t guess—collect details and mark FORWARD_TO_LIVE_PERSON.
+
+SCRIPTS (keep these short):
+- Greeting: “Thanks for calling All Reliable's property management maintenance line. How can I help you?”
+- Emergency safety: “If this is a life-safety emergency, please hang up and dial 911 now.”
+- Forward to live person: “I’ll have a teammate follow up. May I get your name and number, and a quick summary?”
+- Wrap-up: “Got it. I have your number as ______. Is that correct? Anything else to add?”
+- Closing: “Thanks for calling All Reliable - someone will follow up shortly.”
+""".strip()
+
     try:
-        # 2) Send session.update (unchanged audio config)
+        # 2) Send session.update (audio in/out stays μ-law; voice stays from env)
         session_update = {
             "type": "session.update",
             "session": {
@@ -347,20 +386,24 @@ async def _handle_call_async(ws, trace):
                         "voice": OPENAI_VOICE or "alloy"
                     }
                 },
-                "instructions": "You are a voice agent. Speak replies out loud; keep them brief."
+                "instructions": SYSTEM_PROMPT
             }
         }
         await openai_ws.send(json.dumps(session_update))
         log("openai.session.update.sent", trace=trace)
 
-        # 3) Kick off greeting (unchanged)
+        # 3) Kick off greeting that matches the prompt’s script
         await openai_ws.send(json.dumps({
             "type": "response.create",
-            "response": {"instructions": "In English only, begin the conversation by saying exactly: Hello from Escallop."}
+            "response": {
+                "instructions": (
+                    Thanks for calling All Reliable's property management maintenance line. How can I help you?"
+                )
+            }
         }))
         log("openai.response.create.greeting", trace=trace)
 
-        # 4) Bridge tasks
+        # 4) Bridge tasks (unchanged)
         stream_info = {"sid": None, "trace": trace}
         recv_task = asyncio.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         send_task = asyncio.create_task(twilio_to_openai(ws, openai_ws, stream_info))
@@ -380,8 +423,6 @@ async def _handle_call_async(ws, trace):
             log("openai.ws.closed", trace=trace)
         except Exception as e:
             log("openai.ws.close.error", trace=trace, error=repr(e))
-
-
 
 # --- WebSocket: Twilio connects here ---
 # --- WebSocket: Twilio connects here ---
