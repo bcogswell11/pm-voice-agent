@@ -397,7 +397,7 @@ SCRIPTS (keep these short):
             "type": "response.create",
             "response": {
                 "instructions": (
-                    Thanks for calling All Reliable's property management maintenance line. How can I help you?"
+                    "Thanks for calling All Reliable's property management maintenance line. How can I help you?"
                 )
             }
         }))
