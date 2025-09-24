@@ -402,18 +402,20 @@ SCRIPTS (keep these short, but use the chosen language consistently):
         await openai_ws.send(json.dumps(session_update))
         log("openai.session.update.sent", trace=trace)
 
-        # 3) Kick off greeting (English default; Spanish if caller begins in Spanish handled by prompt)
+        # 3) Force the opening greeting (no variation allowed)
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
+                "conversation": False,   # ensures exact scripted output
                 "instructions": (
-                    "Thanks for calling All Reliable's property management maintenance line. How can I help you?"
+                    "Thanks for calling All Reliable's property management maintenance line. "
+                    "How can I help you?"
                 )
             }
         }))
-        log("openai.response.create.greeting", trace=trace)
+        log("openai.response.create.forced_greeting", trace=trace)
 
-        # 4) Bridge tasks (unchanged)
+        # 4) Bridge tasks
         stream_info = {"sid": None, "trace": trace}
         recv_task = asyncio.create_task(openai_to_twilio(ws, openai_ws, stream_info))
         send_task = asyncio.create_task(twilio_to_openai(ws, openai_ws, stream_info))
