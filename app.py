@@ -52,7 +52,7 @@ def rms_pcm16(buf: bytes) -> int:
 # --- Config (from Heroku Config Vars) ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
-OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # --- App setup ---
